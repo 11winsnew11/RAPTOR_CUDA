@@ -4,7 +4,7 @@ OBJ         := $(SRC:.cu=.o)
 CC          := nvcc
 
 GPU_ARCH ?= $(shell nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1 | tr -d '.')
-SM_ARCHS   := 75 86 89 $(GPU_ARCH)
+SM_ARCHS   := 70 75 86 89 $(GPU_ARCH)
 GENCODE    := $(foreach arch,$(SM_ARCHS),-gencode arch=compute_$(arch),code=sm_$(arch))
 
 NVCC_FLAGS := -O3 -rdc=true -use_fast_math --ptxas-options=-O3 $(GENCODE)
