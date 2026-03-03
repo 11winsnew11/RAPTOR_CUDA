@@ -48,8 +48,6 @@ __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Jx[4];
 __constant__ uint64_t c_Jy[4];
 __constant__ int c_target_len;
-__constant__ uint8_t c_target_hash160[20];
-__constant__ uint32_t c_target_prefix;
 
 // Helper device function untuk vanity check
 __device__ __forceinline__ bool check_vanity_match(
