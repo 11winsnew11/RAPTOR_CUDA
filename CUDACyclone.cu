@@ -1,4 +1,3 @@
-
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cstdint>
@@ -49,6 +48,34 @@ __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Jx[4];
 __constant__ uint64_t c_Jy[4];
 
+// MODIFIKASI: Tambahkan panjang target (dalam byte) untuk vanity search
+__device__ __constant__ int c_target_len;
+
+// Helper device function untuk vanity check
+__device__ __forceinline__ bool check_vanity_match(
+    const uint8_t* __restrict__ h, 
+    const uint8_t* __restrict__ target, 
+    int len,
+    uint32_t target_prefix_u32) 
+{
+    // Optimisasi: Jika len >= 4, cek 4 byte pertama dengan cepat
+    if (len >= 4) {
+        // load_u32_le diasumsikan ada di CUDA_Utils.h atau implementasi lokal
+        // Implementasi sederhana load little endian 32-bit
+        uint32_t h_prefix = (uint32_t)h[0] | ((uint32_t)h[1] << 8) | ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 24);
+        if (h_prefix != target_prefix_u32) return false;
+    }
+
+    // Cek byte per byte untuk panjang yang diminta
+    // Unroll loop untuk performa
+    for (int k = 0; k < 20; ++k) {
+        if (k < len) {
+            if (h[k] != target[k]) return false;
+        }
+    }
+    return true;
+}
+
 __launch_bounds__(256, 2)
 __global__ void kernel_point_add_and_check_oneinv(
     const uint64_t* __restrict__ Px,
@@ -78,6 +105,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
     const uint32_t target_prefix = c_target_prefix;
+    const int target_len = c_target_len; // Load panjang target
 
     unsigned int local_hashes = 0;
     #define FLUSH_THRESHOLD 65536u
@@ -111,27 +139,31 @@ __global__ void kernel_point_add_and_check_oneinv(
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
+        // BLOK PENCEKAN 1: Titik Saat Ini (Base Point)
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool pref = hash160_prefix_equals(h20, target_prefix);
-            if (__any_sync(full_mask, pref)) {
-                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        d_found_result->threadId = (int)gid;
-                        d_found_result->iter     = 0;
+            // MODIFIKASI: Gunakan logika vanity check
+            bool match = check_vanity_match(h20, c_target_hash160, target_len, target_prefix);
+            
+            // Optimisasi warp jika ada salah satu thread yang match (untuk memicu sync)
+            // Catatan: Untuk vanity, __any_sync bisa sering terpicu jika prefix pendek, 
+            // tapi di sini kita hanya exit jika match sempurna (FOUND_READY).
+            if (match) {
+                if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                    d_found_result->threadId = (int)gid;
+                    d_found_result->iter     = 0;
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
+                    for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
+                    for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
-                    }
+                    for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
+                    __threadfence_system();
+                    atomicExch(d_found_flag, FOUND_READY);
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
@@ -169,12 +201,14 @@ __global__ void kernel_point_add_and_check_oneinv(
         ModNeg256(sy_neg, y1);
         ModNeg256(sx_neg, x1);
 
+        // Loop Iterasi Batch (Addition Chain)
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
+            // Sub-blok: P + (i+1)G
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -195,31 +229,30 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool pref = hash160_prefix_equals(h20, target_prefix);
-                if (__any_sync(full_mask, pref)) {
-                    if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t addv=(uint64_t)(i+1);
-                            for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
+                bool match = check_vanity_match(h20, c_target_hash160, target_len, target_prefix);
+                if (match) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                        uint64_t addv=(uint64_t)(i+1);
+                        for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                           
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                       
+                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                        d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
+                        __threadfence_system();
+                        atomicExch(d_found_flag, FOUND_READY);
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
             }
 
+            // Sub-blok: P - (i+1)G
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -241,25 +274,23 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                bool pref = hash160_prefix_equals(h20, target_prefix);
-                if (__any_sync(full_mask, pref)) {
-                    if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t sub=(uint64_t)(i+1);
-                            for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+                bool match = check_vanity_match(h20, c_target_hash160, target_len, target_prefix);
+                if (match) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                        uint64_t sub=(uint64_t)(i+1);
+                        for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
 #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                        d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
+                        __threadfence_system();
+                        atomicExch(d_found_flag, FOUND_READY);
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
@@ -272,6 +303,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(inverse, inverse, gxmi);
         }
 
+        // Iterasi terakhir (i = half - 1)
         {
             const int i = half - 1;
             uint64_t dx_inv_i[4];
@@ -297,28 +329,26 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool pref = hash160_prefix_equals(h20, target_prefix);
-            if (__any_sync(full_mask, pref)) {
-                if (pref && hash160_matches_prefix_then_full(h20, c_target_hash160, target_prefix)) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t sub=(uint64_t)half;
-                        for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+            bool match = check_vanity_match(h20, c_target_hash160, target_len, target_prefix);
+            if (match) {
+                if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                    uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                    uint64_t sub=(uint64_t)half;
+                    for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                    for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+                    for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                    uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid;
-                        d_found_result->iter     = 0;
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
-                    }
+                    for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                    d_found_result->threadId = (int)gid;
+                    d_found_result->iter     = 0;
+                    __threadfence_system();
+                    atomicExch(d_found_flag, FOUND_READY);
                 }
-                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
+            __syncwarp(full_mask); WARP_FLUSH_HASHES(); return; // Jika match, return di sini
 
             uint64_t last_dx[4];
 #pragma unroll
@@ -327,6 +357,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(inverse, inverse, last_dx);
         }
 
+        // Lompat ke batch berikutnya (P = P + B*G)
         {
             uint64_t lam[4], s[4], x3[4], y3[4];
 
@@ -439,7 +470,7 @@ int main(int argc, char** argv) {
 
     if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <hash160_hex>) [--grid A,B] [--slices N]\n";
+                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <partial_hash160_hex>) [--grid A,B] [--slices N]\n";
         return EXIT_FAILURE;
     }
     if (!target_hash_hex.empty() && !address_b58.empty()) {
@@ -458,14 +489,41 @@ int main(int argc, char** argv) {
     }
 
     uint8_t target_hash160[20];
+    int target_len = 20; // Default full length
+
     if (!address_b58.empty()) {
         if (!decode_p2pkh_address(address_b58, target_hash160)) {
             std::cerr << "Error: invalid P2PKH address\n"; return EXIT_FAILURE;
         }
+        target_len = 20; // Address implies full match
     } else {
-        if (!hexToHash160(target_hash_hex, target_hash160)) {
-            std::cerr << "Error: invalid target hash160 hex\n"; return EXIT_FAILURE;
+        // MODIFIKASI: Handle partial hash160 (vanity)
+        std::string h_clean = target_hash_hex;
+        // Hapus 0x prefix jika ada
+        if (h_clean.size() >= 2 && h_clean[0] == '0' && (h_clean[1] == 'x' || h_clean[1] == 'X')) {
+            h_clean = h_clean.substr(2);
         }
+        
+        if (h_clean.empty() || h_clean.size() > 40) {
+            std::cerr << "Error: target hash160 hex length must be between 1 and 40 chars.\n";
+            return EXIT_FAILURE;
+        }
+        if (h_clean.size() % 2 != 0) {
+            std::cerr << "Error: target hash160 hex must have even length.\n";
+            return EXIT_FAILURE;
+        }
+
+        target_len = h_clean.size() / 2;
+        
+        // Pad dengan 00 di belakang (padding tidak mempengaruhi pengecekan prefix)
+        std::string padded_hex = h_clean + std::string(40 - h_clean.size(), '0');
+        
+        if (!hexToHash160(padded_hex, target_hash160)) {
+            std::cerr << "Error: invalid target hash160 hex chars.\n";
+            return EXIT_FAILURE;
+        }
+        
+        std::cout << "Vanity Mode: Searching for Hash160 starting with " << h_clean << " (" << target_len << " bytes)\n";
     }
 
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
@@ -599,12 +657,17 @@ int main(int argc, char** argv) {
     }
 
     {
-        uint32_t prefix_le = (uint32_t)target_hash160[0]
-                           | ((uint32_t)target_hash160[1] << 8)
-                           | ((uint32_t)target_hash160[2] << 16)
-                           | ((uint32_t)target_hash160[3] << 24);
+        // Hitung prefix untuk optimisasi kernel (hanya jika len >= 4)
+        uint32_t prefix_le = 0;
+        if (target_len >= 4) {
+            prefix_le = (uint32_t)target_hash160[0]
+                       | ((uint32_t)target_hash160[1] << 8)
+                       | ((uint32_t)target_hash160[2] << 16)
+                       | ((uint32_t)target_hash160[3] << 24);
+        }
         cudaMemcpyToSymbol(c_target_prefix, &prefix_le, sizeof(prefix_le));
         cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
+        cudaMemcpyToSymbol(c_target_len, &target_len, sizeof(target_len)); // Kirim panjang target
     }
 
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
@@ -757,13 +820,17 @@ int main(int argc, char** argv) {
                 double delta = (double)(h_hashes - lastHashes);
                 double mkeys = delta / (dt * 1e6);
                 double elapsed = std::chrono::duration<double>(now - t0).count();
+                
+                // Untuk vanity search, progress % mungkin tidak relevan jika range sangat besar, tapi tetap ditampilkan
                 long double total_keys_ld = ld_from_u256(range_len);
                 long double prog = total_keys_ld > 0.0L ? ((long double)h_hashes / total_keys_ld) * 100.0L : 0.0L;
                 if (prog > 100.0L) prog = 100.0L;
+                
                 std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
                           << " s | Speed: " << std::fixed << std::setprecision(1) << mkeys
-                          << " Mkeys/s | Count: " << h_hashes
-                          << " | Progress: " << std::fixed << std::setprecision(2) << (double)prog << " %";
+                          << " Mkeys/s | Count: " << h_hashes;
+                          // Hilangkan persentase jika vanity search bisa sangat lama, tapi biarkan untuk informasi
+                          std::cout << " | Progress: " << std::fixed << std::setprecision(4) << (double)prog << " %";
                 std::cout.flush();
                 lastHashes = h_hashes; tLast = now;
             }
