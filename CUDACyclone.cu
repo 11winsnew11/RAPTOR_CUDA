@@ -47,26 +47,8 @@ __constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Jx[4];
 __constant__ uint64_t c_Jy[4];
-__constant__ int c_target_len;
-
-// Helper device function untuk vanity check
-__device__ __forceinline__ bool check_vanity_match(
-    const uint8_t* __restrict__ h, 
-    int len,
-    uint32_t target_prefix_u32) 
-{
-    // Optimasi: Cek 4 byte pertama (uint32)
-    if (len >= 4) {
-        uint32_t h_prefix = (uint32_t)h[0] | ((uint32_t)h[1] << 8) | ((uint32_t)h[2] << 16) | ((uint32_t)h[3] << 24);
-        if (h_prefix != target_prefix_u32) return false;
-    }
-
-    // Cek byte per byte
-    for (int k = 0; k < len; ++k) {
-        if (h[k] != c_target_hash160[k]) return false;
-    }
-    return true;
-}
+// New constant for vanity length
+__constant__ int c_vanity_len;
 
 __launch_bounds__(256, 2)
 __global__ void kernel_point_add_and_check_oneinv(
@@ -97,7 +79,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     if (warp_found_ready(d_found_flag, full_mask, lane)) return;
 
     const uint32_t target_prefix = c_target_prefix;
-    const int target_len = c_target_len;
+    const int vanity_len = c_vanity_len;
 
     unsigned int local_hashes = 0;
     #define FLUSH_THRESHOLD 65536u
@@ -128,48 +110,66 @@ __global__ void kernel_point_add_and_check_oneinv(
 
     uint32_t batches_done = 0;
 
+    // Helper function-like macro for vanity check
+    // Returns true if matches
+    auto check_vanity = [&](const uint8_t* h20) -> bool {
+        if (vanity_len >= 4) {
+            // Fast check first 4 bytes
+            if (load_u32_le(h20) != target_prefix) return false;
+            // Check remaining bytes
+            #pragma unroll
+            for (int k = 4; k < 20; ++k) {
+                if (k >= vanity_len) break;
+                if (h20[k] != c_target_hash160[k]) return false;
+            }
+            return true;
+        } else {
+            // Slow check (len < 4)
+            for (int k = 0; k < vanity_len; ++k) {
+                if (h20[k] != c_target_hash160[k]) return false;
+            }
+            return true;
+        }
+    };
+
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        // --- 1. CEK TITIK PUSAT (CENTER POINT) ---
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; MAYBE_WARP_FLUSH();
 
-            bool match = check_vanity_match(h20, target_len, target_prefix);
-            if (match) {
-                if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                    d_found_result->threadId = (int)gid;
-                    d_found_result->iter     = 0;
+            bool match = check_vanity(h20);
+            if (__any_sync(full_mask, match)) {
+                if (match) {
+                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                        d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
 #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
 #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
+                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
 #pragma unroll
-                    for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
-                    __threadfence_system();
-                    atomicExch(d_found_flag, FOUND_READY);
+                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
+                        __threadfence_system();
+                        atomicExch(d_found_flag, FOUND_READY);
+                    }
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
         }
 
-        // --- 2. PERSIAPAN BATCH INVERSION (MONTGOMERY TRICK) ---
-        // PERHATIAN: Array lokal besar, butuh Stack Size cukup di Main
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
-        // Kalkulasi produk akumulator
-        // Kita mulai dengan (Jx - x1) sebagai faktor pertama untuk memfasilitasi lompatan nanti
 #pragma unroll
         for (int j=0;j<4;++j) acc[j] = c_Jx[j];
         ModSub256(acc, acc, x1);
 #pragma unroll
         for (int j=0;j<4;++j) subp[half-1][j] = acc[j];
 
-        // Akumulasi mundur untuk persiapan inversi
         for (int i = half - 2; i >= 0; --i) {
 #pragma unroll
             for (int j=0;j<4;++j) tmp[j] = c_Gx[(size_t)(i+1)*4 + j];
@@ -179,7 +179,6 @@ __global__ void kernel_point_add_and_check_oneinv(
             for (int j=0;j<4;++j) subp[i][j] = acc[j];
         }
 
-        // Hitung inversi awal
         uint64_t d0[4], inverse[5];
 #pragma unroll
         for (int j=0;j<4;++j) d0[j] = c_Gx[0*4 + j];
@@ -188,66 +187,77 @@ __global__ void kernel_point_add_and_check_oneinv(
         for (int j=0;j<4;++j) inverse[j] = d0[j];
         _ModMult(inverse, subp[0]);
         inverse[4] = 0ull;
-        _ModInv(inverse); // Inversi mahal (sekali per batch)
+        _ModInv(inverse);
 
-        // --- 3. LOOP ITERASI UTAMA (P +/- G[i]) ---
-        // Loop i dari 0 hingga half-2 (memeriksa P +/- 1G sampai P +/- (half-1)G)
+        uint64_t sy_neg[4], sx_neg[4];
+        ModNeg256(sy_neg, y1);
+        ModNeg256(sx_neg, x1);
+
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            uint64_t px_i[4], py_i[4];
-#pragma unroll
-            for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
-
-            // SUB-BLOK A: P + (i+1)G
             {
                 uint64_t px3[4], s[4], lam[4];
+                uint64_t px_i[4], py_i[4];
+#pragma unroll
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+
                 ModSub256(s, py_i, y1);
                 _ModMult(lam, s, dx_inv_i);
-                _ModSqr(px3, lam);
+
+                _ModSqr(px3, lam);     
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
-                ModSub256(s, x1, px3);
+
+                ModSub256(s, x1, px3); 
                 _ModMult(s, s, lam);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                if (check_vanity_match(h20, target_len, target_prefix)) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t addv=(uint64_t)(i+1);
-                        for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
+                bool match = check_vanity(h20);
+                if (__any_sync(full_mask, match)) {
+                    if (match) {
+                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t addv=(uint64_t)(i+1);
+                            for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                           
+                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid;
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid;
+                            d_found_result->iter     = 0;
+                            __threadfence_system();
+                            atomicExch(d_found_flag, FOUND_READY);
+                        }
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
             }
 
-            // SUB-BLOK B: P - (i+1)G
             {
                 uint64_t px3[4], s[4], lam[4];
-                uint64_t py_i_neg[4];
-                ModNeg256(py_i_neg, py_i);
+                uint64_t px_i[4], py_i[4];
+#pragma unroll
+                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+                ModNeg256(py_i, py_i); 
 
-                ModSub256(s, py_i_neg, y1);
+                ModSub256(s, py_i, y1);
                 _ModMult(lam, s, dx_inv_i);
+
                 _ModSqr(px3, lam);
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
+
                 ModSub256(s, x1, px3);
                 _ModMult(s, s, lam);
                 uint8_t odd; ModSub256isOdd(s, y1, &odd);
@@ -255,27 +265,30 @@ __global__ void kernel_point_add_and_check_oneinv(
                 uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; MAYBE_WARP_FLUSH();
 
-                if (check_vanity_match(h20, target_len, target_prefix)) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t subv=(uint64_t)(i+1);
-                        for (int k=0;k<4 && subv;++k){ uint64_t old=fs[k]; fs[k]=old-subv; subv=(old<subv)?1ull:0ull; }
+                bool match = check_vanity(h20);
+                if (__any_sync(full_mask, match)) {
+                    if (match) {
+                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
+                            uint64_t sub=(uint64_t)(i+1);
+                            for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
+                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
+                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid;
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
+                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
+                            d_found_result->threadId = (int)gid;
+                            d_found_result->iter     = 0;
+                            __threadfence_system();
+                            atomicExch(d_found_flag, FOUND_READY);
+                        }
                     }
                     __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
             }
 
-            // Update inverse untuk iterasi berikutnya
             uint64_t gxmi[4];
 #pragma unroll
             for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
@@ -283,41 +296,38 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(inverse, inverse, gxmi);
         }
 
-        // --- 4. ITERASI TERAKHIR (i = half - 1) ---
-        // Memeriksa P - half*G secara eksplisit.
-        // P + half*G TIDAK diperiksa di sini karena akan menjadi P_new - half*G di batch berikutnya (kontinuitas).
         {
             const int i = half - 1;
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
+            uint64_t px3[4], s[4], lam[4];
             uint64_t px_i[4], py_i[4];
 #pragma unroll
             for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
+            ModNeg256(py_i, py_i);
 
-            // Cek P - half*G
-            {
-                uint64_t px3[4], s[4], lam[4];
-                uint64_t py_i_neg[4];
-                ModNeg256(py_i_neg, py_i);
+            ModSub256(s, py_i, y1);
+            _ModMult(lam, s, dx_inv_i);
 
-                ModSub256(s, py_i_neg, y1);
-                _ModMult(lam, s, dx_inv_i);
-                _ModSqr(px3, lam);
-                ModSub256(px3, px3, x1);
-                ModSub256(px3, px3, px_i);
-                ModSub256(s, x1, px3);
-                _ModMult(s, s, lam);
-                uint8_t odd; ModSub256isOdd(s, y1, &odd);
+            _ModSqr(px3, lam);
+            ModSub256(px3, px3, x1);
+            ModSub256(px3, px3, px_i);
 
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
-                ++local_hashes; MAYBE_WARP_FLUSH();
+            ModSub256(s, x1, px3);
+            _ModMult(s, s, lam);
+            uint8_t odd; ModSub256isOdd(s, y1, &odd);
 
-                if (check_vanity_match(h20, target_len, target_prefix)) {
+            uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+            ++local_hashes; MAYBE_WARP_FLUSH();
+
+            bool match = check_vanity(h20);
+            if (__any_sync(full_mask, match)) {
+                if (match) {
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                         uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t subv=(uint64_t)half;
-                        for (int k=0;k<4 && subv;++k){ uint64_t old=fs[k]; fs[k]=old-subv; subv=(old<subv)?1ull:0ull; }
+                        uint64_t sub=(uint64_t)half;
+                        for (int k=0;k<4 && sub;++k){ uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
 #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
 #pragma unroll
@@ -326,28 +336,25 @@ __global__ void kernel_point_add_and_check_oneinv(
 #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
                         d_found_result->threadId = (int)gid;
+                        d_found_result->iter     = 0;
                         __threadfence_system();
                         atomicExch(d_found_flag, FOUND_READY);
                     }
-                    __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
                 }
+                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
 
-            // Update inverse terakhir untuk persiapan Lompatan (Jump)
             uint64_t last_dx[4];
 #pragma unroll
             for (int j=0;j<4;++j) last_dx[j] = c_Gx[(size_t)i*4 + j];
             ModSub256(last_dx, last_dx, x1);
             _ModMult(inverse, inverse, last_dx);
-            // Sekarang 'inverse' seharusnya == 1 / (Jx - x1)
         }
 
-        // --- 5. BLOK LOMPATAN (JUMP) ---
-        // Lakukan P = P + B*G
         {
             uint64_t lam[4], s[4], x3[4], y3[4];
-            uint64_t Jy_minus_y1[4];
 
+            uint64_t Jy_minus_y1[4];
 #pragma unroll
             for (int j=0;j<4;++j) Jy_minus_y1[j] = c_Jy[j];
             ModSub256(Jy_minus_y1, Jy_minus_y1, y1);
@@ -355,10 +362,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(lam, Jy_minus_y1, inverse);
             _ModSqr(x3, lam);
             ModSub256(x3, x3, x1);
-            
-            uint64_t Jx_local[4]; 
-#pragma unroll
-            for (int j=0;j<4;++j) Jx_local[j]=c_Jx[j];
+            uint64_t Jx_local[4]; for (int j=0;j<4;++j) Jx_local[j]=c_Jx[j];
             ModSub256(x3, x3, Jx_local);
 
             ModSub256(s, x1, x3);
@@ -369,7 +373,6 @@ __global__ void kernel_point_add_and_check_oneinv(
             for (int j=0;j<4;++j) { x1[j] = x3[j]; y1[j] = y3[j]; }
         }
 
-        // Update Scalar & Count
         {
             uint64_t addv=(uint64_t)B;
             for (int k=0;k<4 && addv;++k){ uint64_t old=S[k]; S[k]=old+addv; addv=(S[k]<old)?1ull:0ull; }
@@ -378,7 +381,6 @@ __global__ void kernel_point_add_and_check_oneinv(
         ++batches_done;
     }
 
-    // Simpan state
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         Rx[gid*4+i] = x1[i];
@@ -394,25 +396,24 @@ __global__ void kernel_point_add_and_check_oneinv(
     #undef MAYBE_WARP_FLUSH
     #undef WARP_FLUSH_HASHES
     #undef FLUSH_THRESHOLD
+    #undef check_vanity
 }
 
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
 extern std::string formatHex256(const uint64_t limbs[4]);
 extern long double ld_from_u256(const uint64_t v[4]);
-extern bool decode_p2pkh_address(const std::string& addr, uint8_t out20[20]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
-    std::string target_hash_hex, range_hex, address_b58;
+    std::string range_hex, vanity_hash_hex;
     uint32_t runtime_points_batch_size = 128;
     uint32_t runtime_batches_per_sm    = 8;
     uint32_t slices_per_launch         = 64;
 
-    // Parsing Argument
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
         if (comma == std::string::npos) return false;
@@ -437,8 +438,7 @@ int main(int argc, char** argv) {
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if      (arg == "--target-hash160" && i + 1 < argc) target_hash_hex = argv[++i];
-        else if (arg == "--address"        && i + 1 < argc) address_b58     = argv[++i];
+        if      (arg == "--vanity-hash160" && i + 1 < argc) vanity_hash_hex = argv[++i];
         else if (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
         else if (arg == "--grid"           && i + 1 < argc) {
             uint32_t a=0,b=0;
@@ -460,13 +460,9 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (range_hex.empty() || (target_hash_hex.empty() && address_b58.empty())) {
+    if (range_hex.empty() || vanity_hash_hex.empty()) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> (--address <base58> | --target-hash160 <partial_hash160_hex>) [--grid A,B] [--slices N]\n";
-        return EXIT_FAILURE;
-    }
-    if (!target_hash_hex.empty() && !address_b58.empty()) {
-        std::cerr << "Error: provide either --address or --target-hash160, not both.\n";
+                  << " --range <start_hex>:<end_hex> --vanity-hash160 <prefix_hex> [--grid A,B] [--slices N]\n";
         return EXIT_FAILURE;
     }
 
@@ -480,38 +476,24 @@ int main(int argc, char** argv) {
         std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE;
     }
 
-    uint8_t target_hash160[20];
-    int target_len = 20;
-
-    if (!address_b58.empty()) {
-        if (!decode_p2pkh_address(address_b58, target_hash160)) {
-            std::cerr << "Error: invalid P2PKH address\n"; return EXIT_FAILURE;
-        }
-        target_len = 20;
-    } else {
-        std::string h_clean = target_hash_hex;
-        if (h_clean.size() >= 2 && h_clean[0] == '0' && (h_clean[1] == 'x' || h_clean[1] == 'X')) {
-            h_clean = h_clean.substr(2);
-        }
-        if (h_clean.empty() || h_clean.size() > 40) {
-            std::cerr << "Error: target hash160 hex length must be between 1 and 40 chars.\n";
-            return EXIT_FAILURE;
-        }
-        if (h_clean.size() % 2 != 0) {
-             std::cerr << "Error: target hash160 hex must have even length.\n";
-             return EXIT_FAILURE;
-        }
-        target_len = h_clean.size() / 2;
-        std::string padded_hex = h_clean + std::string(40 - h_clean.size(), '0');
-        
-        if (!hexToHash160(padded_hex, target_hash160)) {
-            std::cerr << "Error: invalid target hash160 hex chars.\n";
-            return EXIT_FAILURE;
-        }
-        std::cout << "Vanity Mode: Searching for Hash160 starting with " << h_clean << " (" << target_len << " bytes)\n";
+    // Parse Vanity Hash160
+    if (vanity_hash_hex.length() > 40 || vanity_hash_hex.length() % 2 != 0) {
+        std::cerr << "Error: Vanity hash160 hex length must be even and <= 40 characters (20 bytes).\n";
+        return EXIT_FAILURE;
     }
+    
+    uint8_t target_hash160[20];
+    // Initialize with zeros (not strictly necessary if length is checked, but safe)
+    memset(target_hash160, 0, 20);
+    
+    // Convert hex string to bytes
+    // Note: We only fill the prefix part. The rest is ignored by the kernel.
+    for (size_t i = 0; i < vanity_hash_hex.length() / 2; ++i) {
+        std::string byteStr = vanity_hash_hex.substr(i * 2, 2);
+        target_hash160[i] = (uint8_t)std::stoul(byteStr, nullptr, 16);
+    }
+    int vanity_len = (int)(vanity_hash_hex.length() / 2);
 
-    // Validasi Batch Size
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
     if (!is_pow2(runtime_points_batch_size) || (runtime_points_batch_size & 1u)) {
         std::cerr << "Error: batch size must be even and a power of two.\n";
@@ -522,8 +504,8 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // Validasi Range
     uint64_t range_len[4]; sub256(range_end, range_start, range_len); add256_u64(range_len, 1ull, range_len);
+
     auto is_zero_256 = [](const uint64_t a[4])->bool { return (a[0]|a[1]|a[2]|a[3]) == 0ull; };
     auto is_power_of_two_256 = [&](const uint64_t a[4])->bool {
         if (is_zero_256(a)) return false;
@@ -554,23 +536,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Init CUDA
     int device=0; cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
         std::cerr<<"CUDA init error\n"; return EXIT_FAILURE;
     }
-    
-    // PERBAIKAN KRITIS: Tingkatkan Stack Size karena kernel menggunakan array local besar (subp)
-    // Batch 256 membutuhkan sekitar 4KB-8KB stack per thread.
-    cudaDeviceSetLimit(cudaLimitStackSize, 12288); // Set ke 12KB untuk aman
-    
+
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
     int threadsPerBlock=256;
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
     if (threadsPerBlock < 32) threadsPerBlock=32;
 
-    // Kalkulasi Grid & Memory (Sama seperti sebelumnya)
     const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t);
     size_t totalGlobalMem = prop.totalGlobalMem;
     const uint64_t reserveBytes = 64ull * 1024 * 1024;
@@ -615,8 +591,11 @@ int main(int argc, char** argv) {
     uint64_t per_thread_cnt[4]; uint64_t r_u64 = 0ull;
     divmod_256_by_u64(range_len, threadsTotal, per_thread_cnt, r_u64);
     if (r_u64 != 0ull) { std::cerr << "Internal error: range_len not divisible by threadsTotal.\n"; return EXIT_FAILURE; }
-    
-    // Alokasi Host
+    {   uint64_t qq[4], rr=0ull;
+        divmod_256_by_u64(per_thread_cnt, (uint64_t)runtime_points_batch_size, qq, rr);
+        if (rr != 0ull) { std::cerr << "Internal error: per-thread count is not a multiple of batch size.\n"; return EXIT_FAILURE; }
+    }
+
     uint64_t* h_counts256     = nullptr;
     uint64_t* h_start_scalars = nullptr;
     cudaHostAlloc(&h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -645,21 +624,22 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Setup Constant Memory
     {
+        // Copy Vanity Target and Length
+        cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
+        cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
+
+        // Calculate prefix (first 4 bytes) for fast check, if len >= 4
         uint32_t prefix_le = 0;
-        if (target_len >= 4) {
-            prefix_le = (uint32_t)target_hash160[0]
+        if (vanity_len >= 4) {
+             prefix_le = (uint32_t)target_hash160[0]
                        | ((uint32_t)target_hash160[1] << 8)
                        | ((uint32_t)target_hash160[2] << 16)
                        | ((uint32_t)target_hash160[3] << 24);
         }
         cudaMemcpyToSymbol(c_target_prefix, &prefix_le, sizeof(prefix_le));
-        cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
-        cudaMemcpyToSymbol(c_target_len, &target_len, sizeof(target_len));
     }
 
-    // Alokasi Device
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
     int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
     unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
@@ -688,7 +668,6 @@ int main(int argc, char** argv) {
       ck(cudaMemcpy(d_found_flag, &zero,   sizeof(int),                cudaMemcpyHostToDevice), "init found_flag");
       ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum"); }
 
-    // Precompute Base Points
     {
         int blocks_scal = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
         scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
@@ -724,8 +703,6 @@ int main(int argc, char** argv) {
         cudaFreeHost(h_scalars_half);
         std::free(h_Gx_half); std::free(h_Gy_half);
     }
-    
-    // Precompute Jump Point B*G
     {
         uint64_t* h_scalarB = nullptr;
         cudaHostAlloc(&h_scalarB, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -752,7 +729,6 @@ int main(int argc, char** argv) {
         cudaFreeHost(h_scalarB);
     }
 
-    // Info & Loop (Sama seperti sebelumnya)
     size_t freeB=0,totalB=0; cudaMemGetInfo(&freeB,&totalB);
     size_t usedB = totalB - freeB;
     double util = totalB ? (double)usedB * 100.0 / (double)totalB : 0.0;
@@ -761,7 +737,7 @@ int main(int argc, char** argv) {
     std::cout << std::left << std::setw(20) << "Device"            << " : " << prop.name << " (compute " << prop.major << "." << prop.minor << ")\n";
     std::cout << std::left << std::setw(20) << "SM"                << " : " << prop.multiProcessorCount << "\n";
     std::cout << std::left << std::setw(20) << "ThreadsPerBlock"   << " : " << threadsPerBlock << "\n";
-    std::cout << std::left << std::setw(20) << "Blocks"            << " : " << blocks << "\n";
+    std::cout << std::left << std::setw(20) << "Blocks"            << " : " << (int)(threadsTotal / (uint64_t)threadsPerBlock) << "\n";
     std::cout << std::left << std::setw(20) << "Points batch size" << " : " << B << "\n";
     std::cout << std::left << std::setw(20) << "Batches/SM"        << " : " << runtime_batches_per_sm << "\n";
     std::cout << std::left << std::setw(20) << "Batches/launch"    << " : " << slices_per_launch << " (per thread)\n";
@@ -769,7 +745,8 @@ int main(int argc, char** argv) {
               << std::fixed << std::setprecision(1) << util << "% ("
               << human_bytes((double)usedB) << " / " << human_bytes((double)totalB) << ")\n";
     std::cout << "------------------------------------------------------- \n";
-    std::cout << std::left << std::setw(20) << "Total threads"     << " : " << (uint64_t)threadsTotal << "\n\n";
+    std::cout << std::left << std::setw(20) << "Total threads"     << " : " << (uint64_t)threadsTotal << "\n";
+    std::cout << std::left << std::setw(20) << "Vanity Target"     << " : " << vanity_hash_hex << " (" << vanity_len << " bytes)\n\n";
     std::cout << "======== Phase-1: BruteForce ==========================\n";
 
     cudaStream_t streamKernel;
@@ -814,15 +791,13 @@ int main(int argc, char** argv) {
                 double delta = (double)(h_hashes - lastHashes);
                 double mkeys = delta / (dt * 1e6);
                 double elapsed = std::chrono::duration<double>(now - t0).count();
-                
                 long double total_keys_ld = ld_from_u256(range_len);
                 long double prog = total_keys_ld > 0.0L ? ((long double)h_hashes / total_keys_ld) * 100.0L : 0.0L;
                 if (prog > 100.0L) prog = 100.0L;
-                
                 std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
                           << " s | Speed: " << std::fixed << std::setprecision(1) << mkeys
                           << " Mkeys/s | Count: " << h_hashes
-                          << " | Progress: " << std::fixed << std::setprecision(4) << (double)prog << " %";
+                          << " | Progress: " << std::fixed << std::setprecision(2) << (double)prog << " %";
                 std::cout.flush();
                 lastHashes = h_hashes; tLast = now;
             }
@@ -872,7 +847,7 @@ int main(int argc, char** argv) {
             exit_code = 130;
         } else if (completed_all) {
             std::cout << "======== KEY NOT FOUND (exhaustive) ===================\n";
-            std::cout << "Target hash160 was not found within the specified range.\n";
+            std::cout << "Target vanity hash160 was not found within the specified range.\n";
         } else {
             std::cout << "======== TERMINATED ===================================\n";
         }
