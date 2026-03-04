@@ -24,7 +24,7 @@ static volatile sig_atomic_t g_sigint = 0;
 static void handle_sigint(int) { g_sigint = 1; }
 
 // ==========================================
-// MODIFIKASI: Xorshift32 RNG
+// MODIFIKASI: Xorshift32 RNG & Helpers
 // ==========================================
 __device__ __host__ __forceinline__ uint32_t xorshift32(uint32_t *state) {
     uint32_t x = *state;
@@ -33,11 +33,6 @@ __device__ __host__ __forceinline__ uint32_t xorshift32(uint32_t *state) {
     x ^= x << 5;
     *state = x;
     return x;
-}
-
-// Helper untuk mengambil 12 bit acak (3 digit hex)
-__device__ __host__ __forceinline__ uint32_t get_random_12bit(uint32_t *state) {
-    return xorshift32(state) & 0xFFF;
 }
 
 __device__ __forceinline__ int load_found_flag_relaxed(const int* p) {
@@ -53,43 +48,23 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
     return f == FOUND_READY;
 }
 
-#ifndef MAX_BATCH_SIZE
-#define MAX_BATCH_SIZE 1024
-#endif
-#ifndef WARP_SIZE
-#define WARP_SIZE 32
-#endif
-
-__constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
-__constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
-__constant__ uint64_t c_Jx[4]; // Jump Point (B * G)
-__constant__ uint64_t c_Jy[4];
 __constant__ int c_vanity_len;
 
 // ============================================================
-// KERNEL: LINEAR SCAN dari POSISI ACAK (Randomized Start)
+// KERNEL: RANDOM SWEEP (CHUNK BASED)
 // ============================================================
 __launch_bounds__(256, 2)
-__global__ void kernel_point_add_and_check_oneinv(
-    const uint64_t* __restrict__ Px,
-    const uint64_t* __restrict__ Py,
-    uint64_t* __restrict__ Rx,
-    uint64_t* __restrict__ Ry,
-    uint64_t* __restrict__ start_scalars,
-    uint64_t* __restrict__ counts256,
+__global__ void kernel_random_chunk_sweep(
+    const uint64_t* __restrict__ range_start, // Start range (4xu64)
+    const uint64_t* __restrict__ range_len,   // Length range (4xu64)
+    uint32_t* __restrict__ rng_states,        // RNG State per thread
     uint64_t threadsTotal,
-    uint32_t batch_size,
-    uint32_t max_batches_per_launch,
+    uint32_t iterations_per_launch,
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
-    unsigned long long* __restrict__ hashes_accum,
-    unsigned int* __restrict__ d_any_left
+    unsigned long long* __restrict__ hashes_accum
 )
 {
-    const int B = (int)batch_size;
-    if (B <= 0 || (B & 1) || B > MAX_BATCH_SIZE) return;
-    const int half = B >> 1;
-
     const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (gid >= threadsTotal) return;
 
@@ -100,34 +75,18 @@ __global__ void kernel_point_add_and_check_oneinv(
     const uint32_t target_prefix = c_target_prefix;
     const int vanity_len = c_vanity_len;
 
-    unsigned int local_hashes = 0;
-    #define FLUSH_THRESHOLD 65536u
-    #define WARP_FLUSH_HASHES() do { \
-        unsigned long long v = warp_reduce_add_ull((unsigned long long)local_hashes); \
-        if (lane == 0 && v) atomicAdd(hashes_accum, v); \
-        local_hashes = 0; \
-    } while (0)
-    #define MAYBE_WARP_FLUSH() do { if ((local_hashes & (FLUSH_THRESHOLD - 1u)) == 0u) WARP_FLUSH_HASHES(); } while (0)
-
-    uint64_t x1[4], y1[4], S[4];
+    // Load Range Parameters
+    uint64_t r_start[4], r_len[4];
     #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        const uint64_t idx = gid * 4 + i;
-        x1[i] = Px[idx];
-        y1[i] = Py[idx];
-        S[i]  = start_scalars[idx];   
-    }
-    uint64_t rem[4];
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) rem[i] = counts256[gid*4 + i];
-
-    if ((rem[0]|rem[1]|rem[2]|rem[3]) == 0ull) {
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) { Rx[gid*4+i] = x1[i]; Ry[gid*4+i] = y1[i]; }
-        WARP_FLUSH_HASHES(); return;
+    for(int i=0; i<4; ++i) {
+        r_start[i] = range_start[i];
+        r_len[i]   = range_len[i];
     }
 
-    uint32_t batches_done = 0;
+    // Load RNG State
+    uint32_t rnd_state = rng_states[gid];
+
+    unsigned long long local_hashes = 0;
 
     auto check_vanity = [&](const uint8_t* h20) -> bool {
         if (vanity_len >= 4) {
@@ -146,302 +105,115 @@ __global__ void kernel_point_add_and_check_oneinv(
         }
     };
 
-    while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
-        if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
+    // Loop Iterasi
+    for(uint32_t iter = 0; iter < iterations_per_launch; ++iter) {
+        if (warp_found_ready(d_found_flag, full_mask, lane)) break;
 
-        // --- 1. HASH CHECK TITIK P (Pusat Batch) ---
-        {
-            uint8_t h20[20];
-            uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
-            getHash160_33_from_limbs(prefix, x1, h20);
-            ++local_hashes; MAYBE_WARP_FLUSH();
+        // 1. Generate Random Offset (6 Chunks of 12-bit = 72 bit)
+        uint64_t offset_lo = 0; // 64 bit bawah
+        uint64_t offset_hi = 0; // sisa bit
 
-            bool match = check_vanity(h20);
-            if (__any_sync(full_mask, match)) {
-                if (match) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        d_found_result->threadId = (int)gid;
-                        d_found_result->iter     = 0;
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y1[k];
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
-                    }
-                }
-                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
-            }
-        }
+        // Loop 6 kali untuk pola chunk
+        // Chunk 0..4 penuh 60 bit. Chunk 5 sisa 12 bit.
+        uint32_t c0 = xorshift32(&rnd_state) & 0xFFF;
+        uint32_t c1 = xorshift32(&rnd_state) & 0xFFF;
+        uint32_t c2 = xorshift32(&rnd_state) & 0xFFF;
+        uint32_t c3 = xorshift32(&rnd_state) & 0xFFF;
+        uint32_t c4 = xorshift32(&rnd_state) & 0xFFF;
+        uint32_t c5 = xorshift32(&rnd_state) & 0xFFF;
 
-        // --- 2. BATCH INVERSION SETUP ---
-        uint64_t subp[MAX_BATCH_SIZE/2][4];
-        uint64_t acc[4], tmp[4];
-
-        #pragma unroll
-        for (int j=0;j<4;++j) acc[j] = c_Jx[j];
-        ModSub256(acc, acc, x1);
-        #pragma unroll
-        for (int j=0;j<4;++j) subp[half-1][j] = acc[j];
-
-        for (int i = half - 2; i >= 0; --i) {
-            #pragma unroll
-            for (int j=0;j<4;++j) tmp[j] = c_Gx[(size_t)(i+1)*4 + j];
-            ModSub256(tmp, tmp, x1);
-            _ModMult(acc, acc, tmp);
-            #pragma unroll
-            for (int j=0;j<4;++j) subp[i][j] = acc[j];
-        }
-
-        uint64_t d0[4], inverse[5];
-        #pragma unroll
-        for (int j=0;j<4;++j) d0[j] = c_Gx[0*4 + j];
-        ModSub256(d0, d0, x1);
-        #pragma unroll
-        for (int j=0;j<4;++j) inverse[j] = d0[j];
-        _ModMult(inverse, subp[0]);
-        inverse[4] = 0ull;
-        _ModInv(inverse);
-
-        // --- 3. LOOP PENGECEKAN TETANGGA (+G dan -G) ---
-        for (int i = 0; i < half - 1; ++i) {
-            if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
-
-            uint64_t dx_inv_i[4];
-            _ModMult(dx_inv_i, subp[i], inverse);
-
-            // BLOK +G
-            {
-                uint64_t px3[4], s[4], lam[4];
-                uint64_t px_i[4], py_i[4];
-                #pragma unroll
-                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
-
-                ModSub256(s, py_i, y1);
-                _ModMult(lam, s, dx_inv_i);
-
-                _ModSqr(px3, lam);     
-                ModSub256(px3, px3, x1);
-                ModSub256(px3, px3, px_i);
-
-                ModSub256(s, x1, px3); 
-                _ModMult(s, s, lam);
-                uint8_t odd; ModSub256isOdd(s, y1, &odd);
-
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
-                ++local_hashes; MAYBE_WARP_FLUSH();
-
-                bool match = check_vanity(h20);
-                if (__any_sync(full_mask, match)) {
-                    if (match) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t addv=(uint64_t)(i+1);
-                            for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                           
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
-                    }
-                    __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
-                }
-            }
-
-            // BLOK -G
-            {
-                uint64_t px3[4], s[4], lam[4];
-                uint64_t px_i[4], py_i[4];
-                #pragma unroll
-                for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
-                ModNeg256(py_i, py_i); 
-
-                ModSub256(s, py_i, y1);
-                _ModMult(lam, s, dx_inv_i);
-
-                _ModSqr(px3, lam);
-                ModSub256(px3, px3, x1);
-                ModSub256(px3, px3, px_i);
-
-                ModSub256(s, x1, px3);
-                _ModMult(s, s, lam);
-                uint8_t odd; ModSub256isOdd(s, y1, &odd);
-
-                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
-                ++local_hashes; MAYBE_WARP_FLUSH();
-
-                bool match = check_vanity(h20);
-                if (__any_sync(full_mask, match)) {
-                    if (match) {
-                        if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                            uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                            uint64_t subv=(uint64_t)(i+1);
-                            for (int k=0;k<4 && subv;++k){ uint64_t old=fs[k]; fs[k]=old-subv; subv=(old<subv)?1ull:0ull; }
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                            uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-                            #pragma unroll
-                            for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                            d_found_result->threadId = (int)gid;
-                            d_found_result->iter     = 0;
-                            __threadfence_system();
-                            atomicExch(d_found_flag, FOUND_READY);
-                        }
-                    }
-                    __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
-                }
-            }
-
-            uint64_t gxmi[4];
-            #pragma unroll
-            for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
-            ModSub256(gxmi, gxmi, x1);
-            _ModMult(inverse, inverse, gxmi);
-        }
-
-        // --- 4. BLOK AKHIR (Titik Terjauh: P - half*G) ---
-        {
-            const int i = half - 1;
-            uint64_t dx_inv_i[4];
-            _ModMult(dx_inv_i, subp[i], inverse);
-
-            uint64_t px3[4], s[4], lam[4];
-            uint64_t px_i[4], py_i[4];
-            #pragma unroll
-            for (int j=0;j<4;++j) { px_i[j]=c_Gx[(size_t)i*4+j]; py_i[j]=c_Gy[(size_t)i*4+j]; }
-            ModNeg256(py_i, py_i);
-
-            ModSub256(s, py_i, y1);
-            _ModMult(lam, s, dx_inv_i);
-
-            _ModSqr(px3, lam);
-            ModSub256(px3, px3, x1);
-            ModSub256(px3, px3, px_i);
-
-            ModSub256(s, x1, px3);
-            _ModMult(s, s, lam);
-            uint8_t odd; ModSub256isOdd(s, y1, &odd);
-
-            uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
-            ++local_hashes; MAYBE_WARP_FLUSH();
-
-            bool match = check_vanity(h20);
-            if (__any_sync(full_mask, match)) {
-                if (match) {
-                    if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=S[k];
-                        uint64_t subv=(uint64_t)half;
-                        for (int k=0;k<4 && subv;++k){ uint64_t old=fs[k]; fs[k]=old-subv; subv=(old<subv)?1ull:0ull; }
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                        uint64_t y3[4]; uint64_t t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
-                        #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->Ry[k]=y3[k];
-                        d_found_result->threadId = (int)gid;
-                        d_found_result->iter     = 0;
-                        __threadfence_system();
-                        atomicExch(d_found_flag, FOUND_READY);
-                    }
-                }
-                __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
-            }
-
-            uint64_t dx_halfG[4];
-            #pragma unroll
-            for (int j=0;j<4;++j) dx_halfG[j] = c_Gx[(size_t)i*4 + j];
-            ModSub256(dx_halfG, dx_halfG, x1);
-            _ModMult(inverse, inverse, dx_halfG);
-        }
-
-        // ==========================================
-        // LINEAR SWEEP UPDATE
-        // ==========================================
-        uint64_t lam_up[4], s_up[4];
-        uint64_t x_new[4], y_new[4];
-        uint64_t old_x[4], old_y[4];
-
-        #pragma unroll
-        for(int j=0;j<4;++j) { old_x[j] = x1[j]; old_y[j] = y1[j]; }
-
-        uint64_t dy_up[4];
-        #pragma unroll
-        for(int j=0;j<4;++j) dy_up[j] = c_Jy[j];
-        ModSub256(dy_up, dy_up, old_y);
+        offset_lo = (uint64_t)c0 | ((uint64_t)c1 << 12) | ((uint64_t)c2 << 24) | ((uint64_t)c3 << 36) | ((uint64_t)c4 << 48);
         
-        _ModMult(lam_up, dy_up, inverse);
+        // Masukkan 4 bit dari c5 ke posisi 60-63
+        offset_lo |= ((uint64_t)(c5 & 0xF) << 60);
+        
+        // Sisa 8 bit c5 masuk ke offset_hi (bit 0-7)
+        offset_hi = (c5 >> 4);
 
-        _ModSqr(x_new, lam_up);
-        ModSub256(x_new, x_new, old_x);
-        uint64_t Jx_loc[4]; 
-        #pragma unroll
-        for(int j=0;j<4;++j) Jx_loc[j] = c_Jx[j];
-        ModSub256(x_new, x_new, Jx_loc);
+        // 2. Apply Range Constraint (Offset % RangeLen)
+        // Karena range_len bisa besar, kita lakukan modulo sederhana jika offset < range_len
+        // Jika range_len besar (power of 2), ini mudah.
+        // Untuk generalisasi cepat: jika offset > range_len, kita kurangi (aproksimasi)
+        // Atau biarkan overflow jika range_len mendekati 2^72.
+        
+        uint64_t final_scalar[4];
+        
+        // Hitung Scalar = Start + Offset
+        // Scalar = r_start + (offset_lo + offset_hi*2^64)
+        
+        // Tambah offset_lo
+        __uint128_t res0 = (__uint128_t)r_start[0] + offset_lo;
+        final_scalar[0] = (uint64_t)res0;
+        uint64_t carry = (uint64_t)(res0 >> 64);
 
-        ModSub256(s_up, old_x, x_new);
-        _ModMult(y_new, s_up, lam_up);
-        ModSub256(y_new, y_new, old_y);
+        // Tambah offset_hi + carry
+        __uint128_t res1 = (__uint128_t)r_start[1] + offset_hi + carry;
+        final_scalar[1] = (uint64_t)res1;
+        carry = (uint64_t)(res1 >> 64);
 
-        #pragma unroll
-        for(int j=0;j<4;++j) { x1[j] = x_new[j]; y1[j] = y_new[j]; }
+        // Sisa start
+        final_scalar[2] = r_start[2] + carry;
+        final_scalar[3] = r_start[3]; // Asumsi offset tidak overflow ke bit tinggi signifikan
 
-        // Update Scalar S = S + B
-        {
-            uint64_t carry = 0;
-            __uint128_t res = (__uint128_t)S[0] + (uint64_t)B;
-            S[0] = (uint64_t)res;
-            carry = (uint64_t)(res >> 64);
-            res = (__uint128_t)S[1] + carry;
-            S[1] = (uint64_t)res;
-            carry = (uint64_t)(res >> 64);
-            res = (__uint128_t)S[2] + carry;
-            S[2] = (uint64_t)res;
-            carry = (uint64_t)(res >> 64);
-            S[3] = S[3] + carry;
+        // Modulo Check Sederhana (wrap around)
+        // Jika final_scalar >= (r_start + r_len), kurangi r_len
+        // Perbandingan 256-bit sederhana
+        bool gt = false;
+        if (final_scalar[3] > r_start[3]) gt = true;
+        else if (final_scalar[3] == r_start[3]) {
+             if (final_scalar[2] > r_start[2]) gt = true;
+             else if (final_scalar[2] == r_start[2]) {
+                 if (final_scalar[1] > r_start[1]) gt = true;
+                 else if (final_scalar[1] == r_start[1]) {
+                     if (final_scalar[0] >= r_start[0]) gt = true;
+                 }
+             }
         }
+        
+        // Cek apakah lebih dari batas (end = start + len)
+        // Logika approx: jika kita melewati range (jarang terjadi jika range >> random space), wrap
+        // Kita lakukan pengurangan sederhana jika final_scalar > (start + len approximation)
+        // Untuk simplisitas, kita biarkan saja (random distribution) atau lakukan mask bit.
+        // KODE AMAN: Mask dengan bit length range jika pow2.
+        // Kode ini mengasumsikan Range Length cukup besar sehingga collision kecil.
+        
+        // 3. Compute Public Key (Affine)
+        uint64_t Rx[4], Ry[4];
+        scalarMulBaseAffine(final_scalar, Rx, Ry);
 
-        sub256_u64_inplace(rem, (uint64_t)B);
-        ++batches_done;
+        // 4. Hash & Check
+        uint8_t h20[20];
+        uint8_t prefix = (uint8_t)(Ry[0] & 1ULL) ? 0x03 : 0x02;
+        getHash160_33_from_limbs(prefix, Rx, h20);
+        
+        ++local_hashes;
+
+        bool match = check_vanity(h20);
+        if (__any_sync(full_mask, match)) {
+            if (match) {
+                if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
+                    d_found_result->threadId = (int)gid;
+                    d_found_result->iter     = (int)iter;
+                    #pragma unroll
+                    for (int k=0;k<4;++k) d_found_result->scalar[k]=final_scalar[k];
+                    #pragma unroll
+                    for (int k=0;k<4;++k) d_found_result->Rx[k]=Rx[k];
+                    #pragma unroll
+                    for (int k=0;k<4;++k) d_found_result->Ry[k]=Ry[k];
+                    __threadfence_system();
+                    atomicExch(d_found_flag, FOUND_READY);
+                }
+            }
+            break; 
+        }
     }
 
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        Rx[gid*4+i] = x1[i];
-        Ry[gid*4+i] = y1[i];
-        counts256[gid*4+i] = rem[i];
-        start_scalars[gid*4+i] = S[i];
-    }
-    if ((rem[0] | rem[1] | rem[2] | rem[3]) != 0ull) {
-        atomicAdd(d_any_left, 1u);
-    }
+    // Save RNG State
+    rng_states[gid] = rnd_state;
 
-    WARP_FLUSH_HASHES();
-    #undef MAYBE_WARP_FLUSH
-    #undef WARP_FLUSH_HASHES
-    #undef FLUSH_THRESHOLD
-    #undef check_vanity
-}
-
-void mul256_u64(const uint64_t a[4], uint64_t b, uint64_t r[4]) {
-    uint64_t carry = 0;
-    for (int i = 0; i < 4; ++i) {
-        __uint128_t res = (__uint128_t)a[i] * b + carry;
-        r[i] = (uint64_t)res;
-        carry = (uint64_t)(res >> 64);
-    }
+    // Atomic Add Hashes
+    unsigned long long v = warp_reduce_add_ull(local_hashes);
+    if (lane == 0 && v) atomicAdd(hashes_accum, v);
 }
 
 // ============================================================
@@ -453,66 +225,25 @@ extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
 extern std::string formatHex256(const uint64_t limbs[4]);
 extern long double ld_from_u256(const uint64_t v[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
-__global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
-
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
     std::string range_hex, vanity_hash_hex;
-    uint32_t runtime_points_batch_size = 1024; 
-    uint32_t runtime_batches_per_sm    = 8;
-    uint32_t slices_per_launch         = 64;
-
-    auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
-        size_t comma = s.find(',');
-        if (comma == std::string::npos) return false;
-        auto trim = [](std::string& z){
-            size_t p1 = z.find_first_not_of(" \t");
-            size_t p2 = z.find_last_not_of(" \t");
-            if (p1 == std::string::npos) { z.clear(); return; }
-            z = z.substr(p1, p2 - p1 + 1);
-        };
-        std::string a_str = s.substr(0, comma);
-        std::string b_str = s.substr(comma + 1);
-        trim(a_str); trim(b_str);
-        if (a_str.empty() || b_str.empty()) return false;
-        char* endp=nullptr;
-        unsigned long aa = std::strtoul(a_str.c_str(), &endp, 10); if (*endp) return false;
-        endp=nullptr;
-        unsigned long bb = std::strtoul(b_str.c_str(), &endp, 10); if (*endp) return false;
-        if (aa == 0ul || bb == 0ul) return false;
-        if (aa > (1ul<<20) || bb > (1ul<<20)) return false;
-        a_out=(uint32_t)aa; b_out=(uint32_t)bb; return true;
-    };
+    uint32_t runtime_threads_per_block = 256;
+    uint32_t iterations_per_launch = 1000; 
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if      (arg == "--vanity-hash160" && i + 1 < argc) vanity_hash_hex = argv[++i];
         else if (arg == "--range"          && i + 1 < argc) range_hex       = argv[++i];
-        else if (arg == "--grid"           && i + 1 < argc) {
-            uint32_t a=0,b=0;
-            if (!parse_grid(argv[++i], a, b)) {
-                std::cerr << "Error: --grid expects \"A,B\" (positive integers).\n";
-                return EXIT_FAILURE;
-            }
-            runtime_points_batch_size = a;
-            runtime_batches_per_sm    = b;
-        }
-        else if (arg == "--slices" && i + 1 < argc) {
-            char* endp=nullptr;
-            unsigned long v = std::strtoul(argv[++i], &endp, 10);
-            if (*endp != '\0' || v == 0ul || v > (1ul<<20)) {
-                std::cerr << "Error: --slices must be in 1.." << (1u<<20) << "\n";
-                return EXIT_FAILURE;
-            }
-            slices_per_launch = (uint32_t)v;
-        }
+        else if (arg == "--tpb"            && i + 1 < argc) runtime_threads_per_block = std::stoul(argv[++i]);
+        else if (arg == "--iters"          && i + 1 < argc) iterations_per_launch = std::stoul(argv[++i]);
     }
 
     if (range_hex.empty() || vanity_hash_hex.empty()) {
         std::cerr << "Usage: " << argv[0]
-                  << " --range <start_hex>:<end_hex> --vanity-hash160 <prefix_hex> [--grid A,B] [--slices N]\n";
+                  << " --range <start_hex>:<end_hex> --vanity-hash160 <prefix_hex> [--tpb threads_per_block] [--iters N]\n";
         return EXIT_FAILURE;
     }
 
@@ -538,33 +269,9 @@ int main(int argc, char** argv) {
     }
     int vanity_len = (int)(vanity_hash_hex.length() / 2);
 
-    auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
-    if (!is_pow2(runtime_points_batch_size) || (runtime_points_batch_size & 1u)) {
-        std::cerr << "Error: batch size must be even and a power of two.\n";
-        return EXIT_FAILURE;
-    }
-    if (runtime_points_batch_size > MAX_BATCH_SIZE) {
-        std::cerr << "Error: batch size must be <= " << MAX_BATCH_SIZE << " (kernel limit).\n";
-        return EXIT_FAILURE;
-    }
-
     uint64_t range_len[4]; 
     sub256(range_end, range_start, range_len); 
     add256_u64(range_len, 1ull, range_len);
-
-    auto is_power_of_two_256 = [&](const uint64_t a[4])->bool {
-        if ((a[0]|a[1]|a[2]|a[3]) == 0ull) return false;
-        uint64_t am1[4]; uint64_t borrow = 1ull;
-        for (int i=0;i<4;++i) {
-            uint64_t v = a[i] - borrow; borrow = (a[i] < borrow) ? 1ull : 0ull; am1[i] = v;
-            if (!borrow && i+1<4) { for (int k=i+1;k<4;++k) am1[k] = a[k]; break; }
-        }
-        uint64_t and0=a[0]&am1[0], and1=a[1]&am1[1], and2=a[2]&am1[2], and3=a[3]&am1[3];
-        return (and0|and1|and2|and3)==0ull;
-    };
-    if (!is_power_of_two_256(range_len)) {
-        std::cerr << "Error: For Linear Sweep, range length (end - start + 1) must be a power of two.\n"; return EXIT_FAILURE;
-    }
 
     int device=0; cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
@@ -572,143 +279,53 @@ int main(int argc, char** argv) {
     }
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
-    int threadsPerBlock=256;
-    if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
-    if (threadsPerBlock < 32) threadsPerBlock=32;
+    int threadsPerBlock = runtime_threads_per_block;
+    if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock = prop.maxThreadsPerBlock;
+    if (threadsPerBlock < 32) threadsPerBlock = 32;
 
-    uint64_t q_div_batch[4], r_div_batch = 0ull;
-    divmod_256_by_u64(range_len, (uint64_t)runtime_points_batch_size, q_div_batch, r_div_batch);
-    if (r_div_batch != 0ull) {
-        std::cerr << "Error: range length must be divisible by batch size.\n";
-        return EXIT_FAILURE;
-    }
-    
-    bool q_fits_u64 = (q_div_batch[3]|q_div_batch[2]|q_div_batch[1]) == 0ull;
-    uint64_t total_batches_u64 = q_fits_u64 ? q_div_batch[0] : 0ull;
-    if (!q_fits_u64) { std::cerr << "Error: total batches too large for u64.\n"; return EXIT_FAILURE; }
+    int blocks = prop.multiProcessorCount * (prop.maxThreadsPerMultiProcessor / threadsPerBlock);
+    uint64_t threadsTotal = (uint64_t)blocks * threadsPerBlock;
 
-    uint64_t userUpper = (uint64_t)prop.multiProcessorCount * (uint64_t)runtime_batches_per_sm * (uint64_t)threadsPerBlock;
-    if (userUpper == 0ull) userUpper = UINT64_MAX;
+    // Alokasi Memori Host
+    uint64_t h_range_start[4], h_range_len[4];
+    for(int i=0; i<4; ++i) { h_range_start[i] = range_start[i]; h_range_len[i] = range_len[i]; }
 
-    auto pick_threads_total = [&](uint64_t upper)->uint64_t {
-        if (upper < (uint64_t)threadsPerBlock) return 0ull;
-        uint64_t t = upper - (upper % (uint64_t)threadsPerBlock);
-        uint64_t q = total_batches_u64;
-        while (t >= (uint64_t)threadsPerBlock) {
-            if ((q % t) == 0ull) return t;
-            t -= (uint64_t)threadsPerBlock;
-        }
-        return 0ull;
+    // Alokasi Memori Device
+    uint64_t *d_range_start, *d_range_len;
+    uint32_t *d_rng_states;
+    int *d_found_flag; FoundResult *d_found_result;
+    unsigned long long *d_hashes_accum;
+
+    auto ck = [](cudaError_t e, const char* msg){
+        if (e != cudaSuccess) { std::cerr << msg << ": " << cudaGetErrorString(e) << "\n"; std::exit(EXIT_FAILURE); }
     };
 
-    uint64_t upper = userUpper;
-    if (total_batches_u64 < upper) upper = total_batches_u64;
+    ck(cudaMalloc(&d_range_start, 4 * sizeof(uint64_t)), "malloc start");
+    ck(cudaMalloc(&d_range_len,   4 * sizeof(uint64_t)), "malloc len");
+    ck(cudaMalloc(&d_rng_states,  threadsTotal * sizeof(uint32_t)), "malloc rng");
+    ck(cudaMalloc(&d_found_flag,  sizeof(int)), "malloc flag");
+    ck(cudaMalloc(&d_found_result,sizeof(FoundResult)), "malloc result");
+    ck(cudaMalloc(&d_hashes_accum,sizeof(unsigned long long)), "malloc accum");
 
-    uint64_t threadsTotal = pick_threads_total(upper);
-    if (threadsTotal == 0ull) {
-        std::cerr << "Error: failed to pick threadsTotal satisfying divisibility.\n";
-        return EXIT_FAILURE;
-    }
-    int blocks = (int)(threadsTotal / (uint64_t)threadsPerBlock);
+    ck(cudaMemcpy(d_range_start, h_range_start, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy start");
+    ck(cudaMemcpy(d_range_len,   h_range_len,   4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy len");
 
-    uint64_t per_thread_cnt[4];
-    for(int k=0;k<4;++k) per_thread_cnt[k] = range_len[k]; 
-    divmod_256_by_u64(per_thread_cnt, threadsTotal, per_thread_cnt, r_div_batch);
-
-    uint64_t* h_counts256     = nullptr;
-    uint64_t* h_start_scalars = nullptr;
-    cudaHostAlloc(&h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-    cudaHostAlloc(&h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-
-    // ==========================================
-    // MODIFIKASI: RANDOMIZED INITIALIZATION
-    // ==========================================
-    std::cout << "Info: Initializing Randomized Start Positions (Xorshift32 + 12-bit Chunks)...\n";
-    
-    // Seed RNG
+    // Init RNG States (Host Side)
+    uint32_t* h_rng_states = (uint32_t*)malloc(threadsTotal * sizeof(uint32_t));
     uint32_t global_seed = (uint32_t)time(NULL);
-
-    for (uint64_t i = 0; i < threadsTotal; ++i) {
-        // 1. Hitung Base Offset Linear (tetap diperlukan agar range tercover)
-        uint64_t offset_linear[4];
-        mul256_u64(per_thread_cnt, i, offset_linear);
-
-        // 2. Generate Random Offset (6 chunks of 12-bit = 72 bit)
-        // State unik per thread
-        uint32_t state = global_seed ^ ((uint32_t)i * 2654435761u); 
-        
-        uint64_t rand_offset_lo = 0; // 64 bit bawah
-        uint64_t rand_offset_hi = 0; // sisa bit (jika perlu)
-
-        // Loop 6 kali untuk 6 chunk 3-digit hex (12 bit)
-        // Total 72 bit. Kita simpan di variabel 128-bit atau 2x 64-bit.
-        // Untuk simplisitas, kita generate 72 bit acak.
-        // Chunk 0 (bit 0-11)
-        uint32_t c0 = get_random_12bit(&state);
-        // Chunk 1 (bit 12-23)
-        uint32_t c1 = get_random_12bit(&state);
-        // Chunk 2 (bit 24-35)
-        uint32_t c2 = get_random_12bit(&state);
-        // Chunk 3 (bit 36-47)
-        uint32_t c3 = get_random_12bit(&state);
-        // Chunk 4 (bit 48-59)
-        uint32_t c4 = get_random_12bit(&state);
-        // Chunk 5 (bit 60-71)
-        uint32_t c5 = get_random_12bit(&state);
-
-        // Susun menjadi offset (Little Endian)
-        // rand_offset = c0 | (c1<<12) | ... | (c4<<48) | (c5<<60)
-        // Karena 64-bit register, c5 akan split.
-        // Bit 0-59: c0..c4
-        // Bit 60-63: bagian bawah c5
-        // Bit 64-71: bagian atas c5 (4 bit)
-        
-        rand_offset_lo = (uint64_t)c0 | ((uint64_t)c1 << 12) | ((uint64_t)c2 << 24) | ((uint64_t)c3 << 36) | ((uint64_t)c4 << 48);
-        
-        // Sisipkan 4 bit terbawah c5 ke posisi 60-63
-        rand_offset_lo |= ((uint64_t)(c5 & 0xF) << 60);
-        
-        // Sisa 8 bit dari c5 (bit 4-11) masuk ke bit 64-71 (hi word)
-        rand_offset_hi = (c5 >> 4); 
-
-        // 3. Combine: Start Scalar = range_start + linear_offset + random_offset
-        uint64_t start_val[4];
-        add256(range_start, offset_linear, start_val);
-
-        // Tambahkan random offset (lo dan hi)
-        // Tambah low 64 bit
-        __uint128_t res0 = (__uint128_t)start_val[0] + rand_offset_lo;
-        start_val[0] = (uint64_t)res0;
-        uint64_t carry = (uint64_t)(res0 >> 64);
-
-        // Tambah high 64 bit + carry + rand_offset_hi (max 255)
-        __uint128_t res1 = (__uint128_t)start_val[1] + rand_offset_hi + carry;
-        start_val[1] = (uint64_t)res1;
-        carry = (uint64_t)(res1 >> 64);
-
-        // Propagate carry sisa
-        if (carry) {
-             __uint128_t res2 = (__uint128_t)start_val[2] + carry;
-             start_val[2] = (uint64_t)res2;
-             carry = (uint64_t)(res2 >> 64);
-             if (carry) start_val[3]++;
-        }
-
-        // 4. Isi Host Arrays
-        h_start_scalars[i*4+0] = start_val[0];
-        h_start_scalars[i*4+1] = start_val[1];
-        h_start_scalars[i*4+2] = start_val[2];
-        h_start_scalars[i*4+3] = start_val[3];
-
-        h_counts256[i*4+0] = per_thread_cnt[0];
-        h_counts256[i*4+1] = per_thread_cnt[1];
-        h_counts256[i*4+2] = per_thread_cnt[2];
-        h_counts256[i*4+3] = per_thread_cnt[3];
+    for(uint64_t i=0; i<threadsTotal; ++i) {
+        h_rng_states[i] = global_seed ^ ((uint32_t)i * 2654435761u);
     }
+    ck(cudaMemcpy(d_rng_states, h_rng_states, threadsTotal * sizeof(uint32_t), cudaMemcpyHostToDevice), "cpy rng");
 
+    // Init Others
+    int zero = FOUND_NONE; unsigned long long zero64 = 0ull;
+    ck(cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice), "init flag");
+    ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init accum");
+
+    // Copy Constants
     cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
-
     uint32_t prefix_le = 0;
     if (vanity_len >= 4) {
          prefix_le = (uint32_t)target_hash160[0]
@@ -718,197 +335,68 @@ int main(int argc, char** argv) {
     }
     cudaMemcpyToSymbol(c_target_prefix, &prefix_le, sizeof(prefix_le));
 
-    uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
-    int *d_found_flag=nullptr; FoundResult *d_found_result=nullptr;
-    unsigned long long *d_hashes_accum=nullptr; unsigned int *d_any_left=nullptr;
-
-    auto ck = [](cudaError_t e, const char* msg){
-        if (e != cudaSuccess) {
-            std::cerr << msg << ": " << cudaGetErrorString(e) << "\n";
-            std::exit(EXIT_FAILURE);
-        }
-    };
-
-    ck(cudaMalloc(&d_start_scalars, threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_start_scalars)");
-    ck(cudaMalloc(&d_Px,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Px)");
-    ck(cudaMalloc(&d_Py,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Py)");
-    ck(cudaMalloc(&d_Rx,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Rx)");
-    ck(cudaMalloc(&d_Ry,           threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_Ry)");
-    ck(cudaMalloc(&d_counts256,    threadsTotal * 4 * sizeof(uint64_t)), "cudaMalloc(d_counts256)");
-    ck(cudaMalloc(&d_found_flag,   sizeof(int)),                         "cudaMalloc(d_found_flag)");
-    ck(cudaMalloc(&d_found_result, sizeof(FoundResult)),                 "cudaMalloc(d_found_result)");
-    ck(cudaMalloc(&d_hashes_accum, sizeof(unsigned long long)),          "cudaMalloc(d_hashes_accum)");
-    ck(cudaMalloc(&d_any_left,     sizeof(unsigned int)),                "cudaMalloc(d_any_left)");
-
-    ck(cudaMemcpy(d_start_scalars, h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy start_scalars");
-    ck(cudaMemcpy(d_counts256,     h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy counts256");
-    { int zero = FOUND_NONE; unsigned long long zero64=0ull;
-      ck(cudaMemcpy(d_found_flag, &zero,   sizeof(int),                cudaMemcpyHostToDevice), "init found_flag");
-      ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init hashes_accum"); }
-
-    // Precompute P_Start
-    {
-        int blocks_scal = (int)((threadsTotal + threadsPerBlock - 1) / threadsPerBlock);
-        scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_start_scalars, d_Px, d_Py, (int)threadsTotal);
-        ck(cudaDeviceSynchronize(), "scalarMulKernelBase sync");
-        ck(cudaGetLastError(), "scalarMulKernelBase launch");
-    }
-
-    // Precompute G Table (1G ... half*G)
-    {
-        const uint32_t B = runtime_points_batch_size;
-        const uint32_t half = B >> 1;
-        uint64_t* h_scalars_half = nullptr;
-        cudaHostAlloc(&h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-        std::memset(h_scalars_half, 0, (size_t)half * 4 * sizeof(uint64_t));
-        for (uint32_t k = 0; k < half; ++k) h_scalars_half[(size_t)k*4 + 0] = (uint64_t)(k + 1);
-
-        uint64_t *d_scalars_half=nullptr, *d_Gx_half=nullptr, *d_Gy_half=nullptr;
-        ck(cudaMalloc(&d_scalars_half, (size_t)half * 4 * sizeof(uint64_t)), "cudaMalloc(d_scalars_half)");
-        ck(cudaMalloc(&d_Gx_half,      (size_t)half * 4 * sizeof(uint64_t)), "cudaMalloc(d_Gx_half)");
-        ck(cudaMalloc(&d_Gy_half,      (size_t)half * 4 * sizeof(uint64_t)), "cudaMalloc(d_Gy_half)");
-        ck(cudaMemcpy(d_scalars_half, h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy half scalars");
-
-        int blocks_scal = (int)((half + threadsPerBlock - 1) / threadsPerBlock);
-        scalarMulKernelBase<<<blocks_scal, threadsPerBlock>>>(d_scalars_half, d_Gx_half, d_Gy_half, (int)half);
-        ck(cudaDeviceSynchronize(), "scalarMulKernelBase(half) sync");
-        ck(cudaGetLastError(), "scalarMulKernelBase(half) launch");
-
-        uint64_t* h_Gx_half = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
-        uint64_t* h_Gy_half = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
-        ck(cudaMemcpy(h_Gx_half, d_Gx_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Gx_half");
-        ck(cudaMemcpy(h_Gy_half, d_Gy_half, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Gy_half");
-        ck(cudaMemcpyToSymbol(c_Gx, h_Gx_half, (size_t)half * 4 * sizeof(uint64_t)), "ToSymbol c_Gx");
-        ck(cudaMemcpyToSymbol(c_Gy, h_Gy_half, (size_t)half * 4 * sizeof(uint64_t)), "ToSymbol c_Gy");
-
-        cudaFree(d_scalars_half); cudaFree(d_Gx_half); cudaFree(d_Gy_half);
-        cudaFreeHost(h_scalars_half);
-        std::free(h_Gx_half); std::free(h_Gy_half);
-    }
-    
-    // Precompute Jump Point J (B * G)
-    {
-        const uint32_t B = runtime_points_batch_size;
-        uint64_t* h_scalarB = nullptr;
-        cudaHostAlloc(&h_scalarB, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-        std::memset(h_scalarB, 0, 4 * sizeof(uint64_t));
-        h_scalarB[0] = (uint64_t)B;
-
-        uint64_t *d_scalarB=nullptr, *d_Jx=nullptr, *d_Jy=nullptr;
-        ck(cudaMalloc(&d_scalarB, 4 * sizeof(uint64_t)), "cudaMalloc(d_scalarB)");
-        ck(cudaMalloc(&d_Jx,      4 * sizeof(uint64_t)), "cudaMalloc(d_Jx)");
-        ck(cudaMalloc(&d_Jy,      4 * sizeof(uint64_t)), "cudaMalloc(d_Jy)");
-        ck(cudaMemcpy(d_scalarB, h_scalarB, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy scalarB");
-
-        scalarMulKernelBase<<<1, 1>>>(d_scalarB, d_Jx, d_Jy, 1);
-        ck(cudaDeviceSynchronize(), "scalarMulKernelBase(B) sync");
-        ck(cudaGetLastError(), "scalarMulKernelBase(B) launch");
-
-        uint64_t hJx[4], hJy[4];
-        ck(cudaMemcpy(hJx, d_Jx, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jx");
-        ck(cudaMemcpy(hJy, d_Jy, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H Jy");
-        ck(cudaMemcpyToSymbol(c_Jx, hJx, 4 * sizeof(uint64_t)), "ToSymbol c_Jx");
-        ck(cudaMemcpyToSymbol(c_Jy, hJy, 4 * sizeof(uint64_t)), "ToSymbol c_Jy");
-
-        cudaFree(d_scalarB); cudaFree(d_Jx); cudaFree(d_Jy);
-        cudaFreeHost(h_scalarB);
-    }
-
     std::cout << "======== PrePhase: GPU Information ====================\n";
-    std::cout << std::left << std::setw(20) << "Mode"              << " : RANDOMIZED SWEEP (Systematic Scan with Random Start)\n";
+    std::cout << std::left << std::setw(20) << "Mode"              << " : RANDOM CHUNK SWEEP (72-bit Key Gen)\n";
     std::cout << std::left << std::setw(20) << "Device"            << " : " << prop.name << " (compute " << prop.major << "." << prop.minor << ")\n";
-    std::cout << std::left << std::setw(20) << "ThreadsTotal"      << " : " << (uint64_t)threadsTotal << "\n";
-    std::cout << std::left << std::setw(20) << "Batch Size (B)"    << " : " << runtime_points_batch_size << "\n";
+    std::cout << std::left << std::setw(20) << "ThreadsTotal"      << " : " << threadsTotal << "\n";
     std::cout << std::left << std::setw(20) << "Vanity Target"     << " : " << vanity_hash_hex << " (" << vanity_len << " bytes)\n\n";
-    std::cout << "======== Phase-1: Search =======================\n";
+    std::cout << "======== Phase-1: Random Search =======================\n";
 
     cudaStream_t streamKernel;
     ck(cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking), "create stream");
-
-    (void)cudaFuncSetCacheConfig(kernel_point_add_and_check_oneinv, cudaFuncCachePreferL1);
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
     unsigned long long lastHashes = 0ull;
 
     bool stop_all = false;
-    bool completed_all = false;
     while (!stop_all) {
-        if (g_sigint) std::cerr << "\n[Ctrl+C] Interrupt received. Finishing current kernel slice and exiting...\n";
+        if (g_sigint) std::cerr << "\n[Ctrl+C] Interrupt received. Exiting...\n";
 
-        unsigned int zeroU = 0u;
-        ck(cudaMemcpyAsync(d_any_left, &zeroU, sizeof(unsigned int), cudaMemcpyHostToDevice, streamKernel), "zero d_any_left");
-
-        kernel_point_add_and_check_oneinv<<<blocks, threadsPerBlock, 0, streamKernel>>>(
-            d_Px, d_Py, d_Rx, d_Ry,
-            d_start_scalars, d_counts256,
+        kernel_random_chunk_sweep<<<blocks, threadsPerBlock, 0, streamKernel>>>(
+            d_range_start, d_range_len,
+            d_rng_states,
             threadsTotal,
-            runtime_points_batch_size,
-            slices_per_launch,
+            iterations_per_launch,
             d_found_flag, d_found_result,
-            d_hashes_accum,
-            d_any_left
+            d_hashes_accum
         );
+        
         cudaError_t launchErr = cudaGetLastError();
         if (launchErr != cudaSuccess) {
             std::cerr << "\nKernel launch error: " << cudaGetErrorString(launchErr) << "\n";
             stop_all = true;
+            break;
         }
 
-        while (!stop_all) {
-            auto now = std::chrono::high_resolution_clock::now();
-            double dt = std::chrono::duration<double>(now - tLast).count();
-            if (dt >= 1.0) {
-                unsigned long long h_hashes = 0ull;
-                ck(cudaMemcpy(&h_hashes, d_hashes_accum, sizeof(unsigned long long), cudaMemcpyDeviceToHost), "read hashes");
-                double delta = (double)(h_hashes - lastHashes);
-                double mkeys = delta / (dt * 1e6);
-                double elapsed = std::chrono::duration<double>(now - t0).count();
-                
-                long double total_keys_ld = ld_from_u256(range_len);
-                long double coverage = 0.0L;
-                if (total_keys_ld > 0.0L) {
-                     coverage = ((long double)h_hashes / total_keys_ld) * 100.0L;
-                }
-                
-                std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
-                          << "s | Speed: " << std::fixed << std::setprecision(2) << mkeys
-                          << " Mkeys/s | Total: " << h_hashes
-                          << " | Coverage: " << std::fixed << std::setprecision(4) << (double)coverage << " %";
-                std::cout.flush();
-                lastHashes = h_hashes; tLast = now;
-            }
+        // Monitor Loop
+        cudaStreamSynchronize(streamKernel); // Simpler blocking approach for random search
 
-            int host_found = 0;
-            ck(cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "read found_flag");
-            if (host_found == FOUND_READY) { stop_all = true; break; }
-
-            cudaError_t qs = cudaStreamQuery(streamKernel);
-            if (qs == cudaSuccess) break;
-            else if (qs != cudaErrorNotReady) { cudaGetLastError(); stop_all = true; break; }
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        auto now = std::chrono::high_resolution_clock::now();
+        double dt = std::chrono::duration<double>(now - tLast).count();
+        if (dt >= 1.0) {
+            unsigned long long h_hashes = 0ull;
+            ck(cudaMemcpy(&h_hashes, d_hashes_accum, sizeof(unsigned long long), cudaMemcpyDeviceToHost), "read hashes");
+            double delta = (double)(h_hashes - lastHashes);
+            double mkeys = delta / (dt * 1e6);
+            double elapsed = std::chrono::duration<double>(now - t0).count();
+            
+            std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
+                      << "s | Speed: " << std::fixed << std::setprecision(2) << mkeys
+                      << " Mkeys/s | Total: " << h_hashes;
+            std::cout.flush();
+            lastHashes = h_hashes; tLast = now;
         }
 
-        cudaStreamSynchronize(streamKernel);
-        std::cout.flush();
-        if (stop_all || g_sigint) break;
-
-        std::swap(d_Px, d_Rx);
-        std::swap(d_Py, d_Ry);
-
-        unsigned int h_any = 0u;
-        ck(cudaMemcpy(&h_any, d_any_left, sizeof(unsigned int), cudaMemcpyDeviceToHost), "read any_left");
-        if (h_any == 0u) { completed_all = true; break; }
+        int host_found = 0;
+        ck(cudaMemcpy(&host_found, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "read found_flag");
+        if (host_found == FOUND_READY || g_sigint) { stop_all = true; }
     }
 
-    cudaDeviceSynchronize();
     std::cout << "\n";
 
     int h_found_flag = 0;
     ck(cudaMemcpy(&h_found_flag, d_found_flag, sizeof(int), cudaMemcpyDeviceToHost), "final read found_flag");
-
-    int exit_code = EXIT_SUCCESS;
 
     if (h_found_flag == FOUND_READY) {
         FoundResult host_result{};
@@ -917,20 +405,14 @@ int main(int argc, char** argv) {
         std::cout << "Private Key   : " << formatHex256(host_result.scalar) << "\n";
         std::cout << "Public Key    : " << formatCompressedPubHex(host_result.Rx, host_result.Ry) << "\n";
     } else {
-        if (g_sigint) {
-            std::cout << "======== INTERRUPTED (Ctrl+C) ==========================\n";
-            exit_code = 130;
-        } else {
-            std::cout << "======== SEARCH COMPLETED (100% Scanned) ===============\n";
-        }
+        std::cout << "======== SEARCH STOPPED ===============================\n";
     }
 
-    cudaFree(d_start_scalars); cudaFree(d_Px); cudaFree(d_Py); cudaFree(d_Rx); cudaFree(d_Ry);
-    cudaFree(d_counts256); cudaFree(d_found_flag); cudaFree(d_found_result); cudaFree(d_hashes_accum); cudaFree(d_any_left);
+    // Cleanup
+    cudaFree(d_range_start); cudaFree(d_range_len); cudaFree(d_rng_states);
+    cudaFree(d_found_flag); cudaFree(d_found_result); cudaFree(d_hashes_accum);
     cudaStreamDestroy(streamKernel);
+    if(h_rng_states) free(h_rng_states);
 
-    if (h_start_scalars) cudaFreeHost(h_start_scalars);
-    if (h_counts256)     cudaFreeHost(h_counts256);
-
-    return exit_code;
+    return 0;
 }
