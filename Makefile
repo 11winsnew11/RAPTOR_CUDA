@@ -1,5 +1,5 @@
 TARGET      := CUDACyclone
-SRC         := CUDACyclone.cu CUDAHash.cu
+SRC         := CUDA2.cu CUDAHash.cu
 OBJ         := $(SRC:.cu=.o)
 CC          := nvcc
 
