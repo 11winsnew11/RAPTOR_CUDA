@@ -439,6 +439,14 @@ extern std::string formatHex256(const uint64_t limbs[4]);
 extern long double ld_from_u256(const uint64_t v[4]);
 extern std::string formatCompressedPubHex(const uint64_t X[4], const uint64_t Y[4]);
 __global__ void scalarMulKernelBase(const uint64_t* scalars_in, uint64_t* outX, uint64_t* outY, int N);
+void mul256_u64(const uint64_t a[4], uint64_t b, uint64_t r[4]) {
+    uint64_t carry = 0;
+    for (int i = 0; i < 4; ++i) {
+        __uint128_t res = (__uint128_t)a[i] * b + carry;
+        r[i] = (uint64_t)res;
+        carry = (uint64_t)(res >> 64);
+    }
+}
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
