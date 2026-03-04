@@ -13,7 +13,6 @@
 #include <cmath>
 #include <csignal>
 #include <atomic>
-#include <random> // Untuk random start
 
 #include "CUDAMath.h"
 #include "sha256.h"
@@ -37,6 +36,8 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
     return f == FOUND_READY;
 }
 
+// MAX_BATCH_SIZE 1024 (2^10) agar muat di Constant Memory (64KB limit)
+// 1024 sudah cukup besar untuk effisiensi batch inversion
 #ifndef MAX_BATCH_SIZE
 #define MAX_BATCH_SIZE 1024
 #endif
@@ -46,46 +47,13 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 
 __constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
-__constant__ uint64_t c_Jx[4];
+__constant__ uint64_t c_Jx[4]; // Jump Point (B * G)
 __constant__ uint64_t c_Jy[4];
 __constant__ int c_vanity_len;
-__constant__ uint64_t c_RangeStart[4];
 
-// Helper Device Function untuk Point Addition Affine (Generik)
-// Digunakan untuk wrap-around correction: P = P - P_RangeLen
-// PERBAIKAN: Menggunakan casting (uint64_t*) untuk kompatibilitas dengan CUDAMath.h
-__device__ void pointAddAffineGeneric(
-    const uint64_t x1[4], const uint64_t y1[4],
-    const uint64_t x2[4], const uint64_t y2[4],
-    uint64_t x3[4], uint64_t y3[4])
-{
-    // Menghitung lambda = (y2 - y1) * inv(x2 - x1)
-    uint64_t dx[4], dy[4], inv_dx[4], lam[4];
-    
-    // Cast const away karena CUDAMath.h tidak menggunakan const pointer
-    ModSub256(dx, (uint64_t*)x2, (uint64_t*)x1);
-    ModSub256(dy, (uint64_t*)y2, (uint64_t*)y1);
-    
-    // Inverse dx
-    uint64_t inv_tmp[5];
-    inv_tmp[0] = dx[0]; inv_tmp[1] = dx[1]; inv_tmp[2] = dx[2]; inv_tmp[3] = dx[3]; inv_tmp[4] = 0;
-    _ModInv(inv_tmp);
-    inv_dx[0] = inv_tmp[0]; inv_dx[1] = inv_tmp[1]; inv_dx[2] = inv_tmp[2]; inv_dx[3] = inv_tmp[3];
-    
-    _ModMult(lam, dy, inv_dx);
-    
-    // x3 = lam^2 - x1 - x2
-    _ModSqr(x3, lam);
-    ModSub256(x3, x3, (uint64_t*)x1);
-    ModSub256(x3, x3, (uint64_t*)x2);
-    
-    // y3 = lam(x1 - x3) - y1
-    uint64_t t[4];
-    ModSub256(t, (uint64_t*)x1, x3);
-    _ModMult(y3, t, lam);
-    ModSub256(y3, y3, (uint64_t*)y1);
-}
-
+// ============================================================
+// KERNEL: SYSTEMATIC SWEEP (LINEAR SCAN)
+// ============================================================
 __launch_bounds__(256, 2)
 __global__ void kernel_point_add_and_check_oneinv(
     const uint64_t* __restrict__ Px,
@@ -138,6 +106,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     #pragma unroll
     for (int i = 0; i < 4; ++i) rem[i] = counts256[gid*4 + i];
 
+    // Jika count sudah nol, thread ini selesai
     if ((rem[0]|rem[1]|rem[2]|rem[3]) == 0ull) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) { Rx[gid*4+i] = x1[i]; Ry[gid*4+i] = y1[i]; }
@@ -163,10 +132,11 @@ __global__ void kernel_point_add_and_check_oneinv(
         }
     };
 
+    // Loop pemrosesan batch
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        // --- HASH CHECK UTAMA ---
+        // --- 1. HASH CHECK TITIK P (Pusat Batch) ---
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
@@ -193,16 +163,18 @@ __global__ void kernel_point_add_and_check_oneinv(
             }
         }
 
-        // --- BATCH INVERSION LOGIC ---
+        // --- 2. BATCH INVERSION SETUP ---
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
+        // Inisialisasi acc dengan (x_J - x_P)
         #pragma unroll
         for (int j=0;j<4;++j) acc[j] = c_Jx[j];
         ModSub256(acc, acc, x1);
         #pragma unroll
         for (int j=0;j<4;++j) subp[half-1][j] = acc[j];
 
+        // Akumulasi selisih untuk titik-titik G
         for (int i = half - 2; i >= 0; --i) {
             #pragma unroll
             for (int j=0;j<4;++j) tmp[j] = c_Gx[(size_t)(i+1)*4 + j];
@@ -212,6 +184,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             for (int j=0;j<4;++j) subp[i][j] = acc[j];
         }
 
+        // Inversi Tunggal
         uint64_t d0[4], inverse[5];
         #pragma unroll
         for (int j=0;j<4;++j) d0[j] = c_Gx[0*4 + j];
@@ -222,18 +195,14 @@ __global__ void kernel_point_add_and_check_oneinv(
         inverse[4] = 0ull;
         _ModInv(inverse);
 
-        uint64_t sy_neg[4], sx_neg[4];
-        ModNeg256(sy_neg, y1);
-        ModNeg256(sx_neg, x1);
-
-        // --- LOOP PENGECEKAN +G dan -G ---
+        // --- 3. LOOP PENGECEKAN TETANGGA (+G dan -G) ---
         for (int i = 0; i < half - 1; ++i) {
             if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // BLOK +G
+            // BLOK +G (P + (i+1)G)
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -279,7 +248,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
             }
 
-            // BLOK -G
+            // BLOK -G (P - (i+1)G)
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t px_i[4], py_i[4];
@@ -325,6 +294,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
             }
 
+            // Update inverse untuk iterasi berikutnya
             uint64_t gxmi[4];
             #pragma unroll
             for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
@@ -332,7 +302,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(inverse, inverse, gxmi);
         }
 
-        // --- BLOK AKHIR (half - 1) -G ---
+        // --- 4. BLOK AKHIR (Titik Terjauh: P - half*G) ---
         {
             const int i = half - 1;
             uint64_t dx_inv_i[4];
@@ -380,99 +350,67 @@ __global__ void kernel_point_add_and_check_oneinv(
                 }
                 __syncwarp(full_mask); WARP_FLUSH_HASHES(); return;
             }
-
-            uint64_t last_dx[4];
-            #pragma unroll
-            for (int j=0;j<4;++j) last_dx[j] = c_Gx[(size_t)i*4 + j];
-            ModSub256(last_dx, last_dx, x1);
-            _ModMult(inverse, inverse, last_dx);
         }
 
         // ==========================================
-        // GRASSHOPPER UPDATE LOGIC
+        // LINEAR SWEEP UPDATE (NO WRAP)
         // ==========================================
+        // Saat ini, 'inverse' sudah sama dengan 1 / (x_J - x_P)
+        // Kita gunakan ini untuk menghitung P_new = P + J
         
-        // 1. Hitung P_temp = P_current + P_B (J)
-        uint64_t x_temp[4], y_temp[4];
+        uint64_t lam_up[4], s_up[4];
+        uint64_t x_new[4], y_new[4];
+        uint64_t old_x[4], old_y[4];
+
+        // Backup P lama
+        #pragma unroll
+        for(int j=0;j<4;++j) { old_x[j] = x1[j]; old_y[j] = y1[j]; }
+
+        // Hitung Lambda
+        uint64_t dy_up[4];
+        #pragma unroll
+        for(int j=0;j<4;++j) dy_up[j] = c_Jy[j];
+        ModSub256(dy_up, dy_up, old_y); // y_J - y_P
+        
+        _ModMult(lam_up, dy_up, inverse); // lam = (yJ - yP) / (xJ - xP)
+
+        // Hitung X Baru
+        _ModSqr(x_new, lam_up);
+        ModSub256(x_new, x_new, old_x);
+        uint64_t Jx_loc[4]; 
+        #pragma unroll
+        for(int j=0;j<4;++j) Jx_loc[j] = c_Jx[j];
+        ModSub256(x_new, x_new, Jx_loc);
+
+        // Hitung Y Baru
+        ModSub256(s_up, old_x, x_new);
+        _ModMult(y_new, s_up, lam_up);
+        ModSub256(y_new, y_new, old_y);
+
+        // Update State Register
+        #pragma unroll
+        for(int j=0;j<4;++j) { x1[j] = x_new[j]; y1[j] = y_new[j]; }
+
+        // Update Scalar S = S + B
         {
-            uint64_t lam[4], s[4];
-            uint64_t Jy_minus_y1[4];
-            #pragma unroll
-            for (int j=0;j<4;++j) Jy_minus_y1[j] = c_Jy[j];
-            ModSub256(Jy_minus_y1, Jy_minus_y1, y1);
-
-            _ModMult(lam, Jy_minus_y1, inverse);
-            _ModSqr(x_temp, lam);
-            ModSub256(x_temp, x_temp, x1);
-            uint64_t Jx_local[4]; for (int j=0;j<4;++j) Jx_local[j]=c_Jx[j];
-            ModSub256(x_temp, x_temp, Jx_local);
-
-            ModSub256(s, x1, x_temp);
-            _ModMult(y_temp, s, lam);
-            ModSub256(y_temp, y_temp, y1);
-        }
-
-        // 2. Hitung S_temp = S + B
-        uint64_t s_temp[4];
-        uint64_t carry = 0;
-        {
-             __uint128_t res = (__uint128_t)S[0] + (uint64_t)B;
-             s_temp[0] = (uint64_t)res;
-             carry = (uint64_t)(res >> 64);
-             res = (__uint128_t)S[1] + carry;
-             s_temp[1] = (uint64_t)res;
-             carry = (uint64_t)(res >> 64);
-             res = (__uint128_t)S[2] + carry;
-             s_temp[2] = (uint64_t)res;
-             carry = (uint64_t)(res >> 64);
-             s_temp[3] = S[3] + carry;
-        }
-
-        // 3. Cek Wrap-Around
-        bool wrap = false;
-        uint64_t diff[4];
-        uint64_t b_sub = 0;
-        for(int k=0; k<4; ++k) {
-            uint64_t val = s_temp[k];
-            uint64_t sub_val = c_RangeStart[k];
-            uint64_t res = val - sub_val - b_sub;
-            diff[k] = res;
-            b_sub = (val < sub_val + b_sub) ? 1 : 0;
-        }
-        
-        if (diff[3] > c_RangeLen[3] || 
-           (diff[3] == c_RangeLen[3] && diff[2] > c_RangeLen[2]) ||
-           (diff[3] == c_RangeLen[3] && diff[2] == c_RangeLen[2] && diff[1] > c_RangeLen[1]) ||
-           (diff[3] == c_RangeLen[3] && diff[2] == c_RangeLen[2] && diff[1] == c_RangeLen[1] && diff[0] >= c_RangeLen[0])) {
-            wrap = true;
-        }
-        
-        if (wrap) {
-            uint64_t s_final[4];
-            b_sub = 0;
-            for(int k=0; k<4; ++k) {
-                uint64_t val = s_temp[k];
-                uint64_t sub_val = c_RangeLen[k];
-                s_final[k] = val - sub_val - b_sub;
-                b_sub = (val < sub_val + b_sub) ? 1 : 0;
-            }
-            
-            uint64_t neg_Y_range[4];
-            ModNeg256(neg_Y_range, (uint64_t*)c_P_RangeLen_Y); // Cast const away
-            
-            pointAddAffineGeneric(x_temp, y_temp, c_P_RangeLen_X, neg_Y_range, x1, y1);
-            
-            #pragma unroll
-            for(int k=0; k<4; ++k) S[k] = s_final[k];
-        } else {
-            #pragma unroll
-            for(int k=0; k<4; ++k) { x1[k] = x_temp[k]; y1[k] = y_temp[k]; S[k] = s_temp[k]; }
+            uint64_t carry = 0;
+            __uint128_t res = (__uint128_t)S[0] + (uint64_t)B;
+            S[0] = (uint64_t)res;
+            carry = (uint64_t)(res >> 64);
+            res = (__uint128_t)S[1] + carry;
+            S[1] = (uint64_t)res;
+            carry = (uint64_t)(res >> 64);
+            res = (__uint128_t)S[2] + carry;
+            S[2] = (uint64_t)res;
+            carry = (uint64_t)(res >> 64);
+            S[3] = S[3] + carry;
         }
 
         sub256_u64_inplace(rem, (uint64_t)B);
         ++batches_done;
     }
 
+    // Simpan State Kembali
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         Rx[gid*4+i] = x1[i];
@@ -491,7 +429,10 @@ __global__ void kernel_point_add_and_check_oneinv(
     #undef check_vanity
 }
 
-// Deklarasi eksternal
+// ============================================================
+// HOST CODE
+// ============================================================
+
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
 extern std::string formatHex256(const uint64_t limbs[4]);
@@ -503,11 +444,11 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
     std::string range_hex, vanity_hash_hex;
-    uint32_t runtime_points_batch_size = 128;
+    uint32_t runtime_points_batch_size = 1024; // Default 1024 (2^10)
     uint32_t runtime_batches_per_sm    = 8;
     uint32_t slices_per_launch         = 64;
 
-    // Parser args
+    // Parser args (Sama seperti sebelumnya)
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
         if (comma == std::string::npos) return false;
@@ -583,6 +524,7 @@ int main(int argc, char** argv) {
     }
     int vanity_len = (int)(vanity_hash_hex.length() / 2);
 
+    // Validasi Batch Size
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
     if (!is_pow2(runtime_points_batch_size) || (runtime_points_batch_size & 1u)) {
         std::cerr << "Error: batch size must be even and a power of two.\n";
@@ -598,7 +540,7 @@ int main(int argc, char** argv) {
     sub256(range_end, range_start, range_len); 
     add256_u64(range_len, 1ull, range_len);
 
-    // Validasi Range Power of 2
+    // Validasi Range Power of 2 (masih diperlukan agar chunk_size bulat)
     auto is_power_of_two_256 = [&](const uint64_t a[4])->bool {
         if ((a[0]|a[1]|a[2]|a[3]) == 0ull) return false;
         uint64_t am1[4]; uint64_t borrow = 1ull;
@@ -610,7 +552,7 @@ int main(int argc, char** argv) {
         return (and0|and1|and2|and3)==0ull;
     };
     if (!is_power_of_two_256(range_len)) {
-        std::cerr << "Error: For Grasshopper Random Leap, range length (end - start + 1) must be a power of two.\n"; return EXIT_FAILURE;
+        std::cerr << "Error: For Linear Sweep, range length (end - start + 1) must be a power of two.\n"; return EXIT_FAILURE;
     }
 
     // Setup GPU
@@ -624,19 +566,15 @@ int main(int argc, char** argv) {
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
     if (threadsPerBlock < 32) threadsPerBlock=32;
 
-    const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t);
-    size_t totalGlobalMem = prop.totalGlobalMem;
-    const uint64_t reserveBytes = 64ull * 1024 * 1024;
-    uint64_t usableMem = (totalGlobalMem > reserveBytes) ? (totalGlobalMem - reserveBytes) : (totalGlobalMem / 2);
-    uint64_t maxThreadsByMem = usableMem / bytesPerThread;
-
     // Kalkulasi Threads Total
     uint64_t q_div_batch[4], r_div_batch = 0ull;
     divmod_256_by_u64(range_len, (uint64_t)runtime_points_batch_size, q_div_batch, r_div_batch);
     if (r_div_batch != 0ull) {
-        std::cerr << "Error: range length must be divisible by batch size (" << runtime_points_batch_size << ").\n";
+        std::cerr << "Error: range length must be divisible by batch size.\n";
         return EXIT_FAILURE;
     }
+    
+    // Total Batches
     bool q_fits_u64 = (q_div_batch[3]|q_div_batch[2]|q_div_batch[1]) == 0ull;
     uint64_t total_batches_u64 = q_fits_u64 ? q_div_batch[0] : 0ull;
     if (!q_fits_u64) { std::cerr << "Error: total batches too large for u64.\n"; return EXIT_FAILURE; }
@@ -644,6 +582,7 @@ int main(int argc, char** argv) {
     uint64_t userUpper = (uint64_t)prop.multiProcessorCount * (uint64_t)runtime_batches_per_sm * (uint64_t)threadsPerBlock;
     if (userUpper == 0ull) userUpper = UINT64_MAX;
 
+    // Penentuan ThreadsTotal
     auto pick_threads_total = [&](uint64_t upper)->uint64_t {
         if (upper < (uint64_t)threadsPerBlock) return 0ull;
         uint64_t t = upper - (upper % (uint64_t)threadsPerBlock);
@@ -655,9 +594,8 @@ int main(int argc, char** argv) {
         return 0ull;
     };
 
-    uint64_t upper = maxThreadsByMem;
+    uint64_t upper = userUpper;
     if (total_batches_u64 < upper) upper = total_batches_u64;
-    if (userUpper         < upper) upper = userUpper;
 
     uint64_t threadsTotal = pick_threads_total(upper);
     if (threadsTotal == 0ull) {
@@ -666,8 +604,10 @@ int main(int argc, char** argv) {
     }
     int blocks = (int)(threadsTotal / (uint64_t)threadsPerBlock);
 
-    uint64_t per_thread_cnt[4]; 
+    // Hitung chunk per thread
+    uint64_t per_thread_cnt[4];
     for(int k=0;k<4;++k) per_thread_cnt[k] = range_len[k]; 
+    divmod_256_by_u64(per_thread_cnt, threadsTotal, per_thread_cnt, r_div_batch); // per_thread_cnt = range_len / threadsTotal
 
     // Alokasi Memori
     uint64_t* h_counts256     = nullptr;
@@ -675,48 +615,35 @@ int main(int argc, char** argv) {
     cudaHostAlloc(&h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
     cudaHostAlloc(&h_start_scalars, threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
 
-    // Inisialisasi Counts
+    // ==========================================
+    // LINEAR INITIALIZATION (SYSTEMATIC SWEEP)
+    // ==========================================
+    std::cout << "Info: Initializing Linear Systematic Sweep positions...\n";
+    
     for (uint64_t i = 0; i < threadsTotal; ++i) {
+        // 1. Hitung Offset = i * per_thread_cnt
+        uint64_t offset[4];
+        mul256_u64(per_thread_cnt, i, offset);
+
+        // 2. Start Scalar = range_start + offset
+        uint64_t start_val[4];
+        add256(range_start, offset, start_val);
+
+        // 3. Isi Host Arrays
+        h_start_scalars[i*4+0] = start_val[0];
+        h_start_scalars[i*4+1] = start_val[1];
+        h_start_scalars[i*4+2] = start_val[2];
+        h_start_scalars[i*4+3] = start_val[3];
+
         h_counts256[i*4+0] = per_thread_cnt[0];
         h_counts256[i*4+1] = per_thread_cnt[1];
         h_counts256[i*4+2] = per_thread_cnt[2];
         h_counts256[i*4+3] = per_thread_cnt[3];
     }
 
-    // ==========================================
-    // GRASSHOPPER INITIALIZATION
-    // ==========================================
-    const uint32_t B = runtime_points_batch_size;
-    const uint32_t half = B >> 1;
-    
-    std::cout << "Info: Initializing Grasshopper Random Start positions...\n";
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<uint64_t> dist(0, std::numeric_limits<uint64_t>::max());
-
-    uint64_t len_minus1[4];
-    {   uint64_t borrow=1ull;
-        for (int i=0;i<4;++i) {
-            uint64_t v=range_len[i]-borrow; borrow=(range_len[i]<borrow)?1ull:0ull; len_minus1[i]=v;
-            if (!borrow && i+1<4) { for (int k=i+1;k<4;++k) len_minus1[k]=range_len[k]; break; }
-        }
-    }
-
-    for (uint64_t i = 0; i < threadsTotal; ++i) {
-        uint64_t rand_offset[4];
-        rand_offset[0] = dist(gen) & len_minus1[0];
-        rand_offset[1] = dist(gen) & len_minus1[1];
-        rand_offset[2] = dist(gen) & len_minus1[2];
-        rand_offset[3] = dist(gen) & len_minus1[3];
-        
-        add256(range_start, rand_offset, &h_start_scalars[i*4]);
-    }
-
     // Copy Constants to Device
     cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
-    cudaMemcpyToSymbol(c_RangeStart, range_start, 4*sizeof(uint64_t));
-    cudaMemcpyToSymbol(c_RangeLen, range_len, 4*sizeof(uint64_t));
 
     uint32_t prefix_le = 0;
     if (vanity_len >= 4) {
@@ -764,8 +691,10 @@ int main(int argc, char** argv) {
         ck(cudaGetLastError(), "scalarMulKernelBase launch");
     }
 
-    // Precompute G Table
+    // Precompute G Table (1G ... half*G)
     {
+        const uint32_t B = runtime_points_batch_size;
+        const uint32_t half = B >> 1;
         uint64_t* h_scalars_half = nullptr;
         cudaHostAlloc(&h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
         std::memset(h_scalars_half, 0, (size_t)half * 4 * sizeof(uint64_t));
@@ -794,8 +723,9 @@ int main(int argc, char** argv) {
         std::free(h_Gx_half); std::free(h_Gy_half);
     }
     
-    // Precompute Jump Point J
+    // Precompute Jump Point J (B * G)
     {
+        const uint32_t B = runtime_points_batch_size;
         uint64_t* h_scalarB = nullptr;
         cudaHostAlloc(&h_scalarB, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
         std::memset(h_scalarB, 0, 4 * sizeof(uint64_t));
@@ -821,44 +751,14 @@ int main(int argc, char** argv) {
         cudaFreeHost(h_scalarB);
     }
 
-    // Precompute RangeLen * G
-    {
-        uint64_t* h_scalarRL = nullptr;
-        cudaHostAlloc(&h_scalarRL, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
-        memcpy(h_scalarRL, range_len, 4 * sizeof(uint64_t));
-
-        uint64_t *d_scalarRL=nullptr, *d_RLx=nullptr, *d_RLy=nullptr;
-        ck(cudaMalloc(&d_scalarRL, 4 * sizeof(uint64_t)), "cudaMalloc(d_scalarRL)");
-        ck(cudaMalloc(&d_RLx,      4 * sizeof(uint64_t)), "cudaMalloc(d_RLx)");
-        ck(cudaMalloc(&d_RLy,      4 * sizeof(uint64_t)), "cudaMalloc(d_RLy)");
-        ck(cudaMemcpy(d_scalarRL, h_scalarRL, 4 * sizeof(uint64_t), cudaMemcpyHostToDevice), "cpy scalarRL");
-
-        scalarMulKernelBase<<<1, 1>>>(d_scalarRL, d_RLx, d_RLy, 1);
-        ck(cudaDeviceSynchronize(), "scalarMulKernelBase(RangeLen) sync");
-        ck(cudaGetLastError(), "scalarMulKernelBase(RangeLen) launch");
-
-        uint64_t hRLx[4], hRLy[4];
-        ck(cudaMemcpy(hRLx, d_RLx, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H RLx");
-        ck(cudaMemcpy(hRLy, d_RLy, 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost), "D2H RLy");
-        ck(cudaMemcpyToSymbol(c_P_RangeLen_X, hRLx, 4 * sizeof(uint64_t)), "ToSymbol c_P_RangeLen_X");
-        ck(cudaMemcpyToSymbol(c_P_RangeLen_Y, hRLy, 4 * sizeof(uint64_t)), "ToSymbol c_P_RangeLen_Y");
-
-        cudaFree(d_scalarRL); cudaFree(d_RLx); cudaFree(d_RLy);
-        cudaFreeHost(h_scalarRL);
-    }
-
     // Info
-    size_t freeB=0,totalB=0; cudaMemGetInfo(&freeB,&totalB);
-    size_t usedB = totalB - freeB;
-    double util = totalB ? (double)usedB * 100.0 / (double)totalB : 0.0;
-
     std::cout << "======== PrePhase: GPU Information ====================\n";
-    std::cout << std::left << std::setw(20) << "Mode"              << " : GRASSHOPPER (Random Start + Wrap)\n";
+    std::cout << std::left << std::setw(20) << "Mode"              << " : LINEAR SWEEP (Systematic Scan)\n";
     std::cout << std::left << std::setw(20) << "Device"            << " : " << prop.name << " (compute " << prop.major << "." << prop.minor << ")\n";
     std::cout << std::left << std::setw(20) << "ThreadsTotal"      << " : " << (uint64_t)threadsTotal << "\n";
-    std::cout << std::left << std::setw(20) << "Batch Size (B)"    << " : " << B << "\n";
+    std::cout << std::left << std::setw(20) << "Batch Size (B)"    << " : " << runtime_points_batch_size << "\n";
     std::cout << std::left << std::setw(20) << "Vanity Target"     << " : " << vanity_hash_hex << " (" << vanity_len << " bytes)\n\n";
-    std::cout << "======== Phase-1: Random Search =======================\n";
+    std::cout << "======== Phase-1: Linear Search =======================\n";
 
     cudaStream_t streamKernel;
     ck(cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking), "create stream");
@@ -881,7 +781,7 @@ int main(int argc, char** argv) {
             d_Px, d_Py, d_Rx, d_Ry,
             d_start_scalars, d_counts256,
             threadsTotal,
-            B,
+            runtime_points_batch_size,
             slices_per_launch,
             d_found_flag, d_found_result,
             d_hashes_accum,
@@ -912,7 +812,7 @@ int main(int argc, char** argv) {
                 std::cout << "\rTime: " << std::fixed << std::setprecision(1) << elapsed
                           << "s | Speed: " << std::fixed << std::setprecision(2) << mkeys
                           << " Mkeys/s | Total: " << h_hashes
-                          << " | Est. Coverage: " << std::fixed << std::setprecision(4) << (double)coverage << " %";
+                          << " | Progress: " << std::fixed << std::setprecision(4) << (double)coverage << " %";
                 std::cout.flush();
                 lastHashes = h_hashes; tLast = now;
             }
@@ -959,7 +859,7 @@ int main(int argc, char** argv) {
             std::cout << "======== INTERRUPTED (Ctrl+C) ==========================\n";
             exit_code = 130;
         } else {
-            std::cout << "======== SEARCH STOPPED ================================\n";
+            std::cout << "======== SEARCH COMPLETED (100% Scanned) ===============\n";
         }
     }
 
