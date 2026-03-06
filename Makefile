@@ -1,5 +1,5 @@
-TARGET      := CUDACyclone
-SRC         := CUDA3.cu CUDAHash.cu
+TARGET      := CMK
+SRC         := MiniKey.cu CUDAHash.cu
 OBJ         := $(SRC:.cu=.o)
 CC          := nvcc
 
