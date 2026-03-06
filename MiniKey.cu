@@ -14,20 +14,30 @@
 #include <csignal>
 #include <atomic>
 
+// Sertakan header math dan utilitas yang sudah ada
 #include "CUDAMath.h"
-// Asumsi CUDAHash.cuh berisi getHash160_33_from_limbs
-#include "CUDAHash.cuh" 
+#include "CUDAHash.cuh"
 #include "CUDAUtils.h"
-// CUDAStructures.h mungkin mendefinisikan FoundResult, kita akan override jika perlu
-// atau pastikan struct di bawah ini kompatibel.
+
+// ============================================================
+// PERBAIKAN ERROR: Definisi Konstanta Status
+// ============================================================
+#ifndef FOUND_NONE
+#define FOUND_NONE  0
+#endif
+#ifndef FOUND_LOCK
+#define FOUND_LOCK  1
+#endif
+#ifndef FOUND_READY
+#define FOUND_READY 2
+#endif
 
 // ============================================================
 // KONFIGURASI & KONSTANTA
 // ============================================================
 #define MAX_MINIKEY_LEN 32
 
-// Override FoundResult untuk menyimpan string Minikey
-#undef FoundResult
+// Struktur hasil (Override jika belum ada di header)
 struct FoundResult {
     int      threadId;
     int      iter;
@@ -46,8 +56,11 @@ __constant__ uint32_t c_target_prefix;
 __constant__ int      c_vanity_len;
 __constant__ int      c_minikey_len_target;
 
-// Base58 Alphabet
-__constant__ const char c_b58_alphabet[58] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+// ============================================================
+// PERBAIKAN ERROR: Ukuran Array Base58
+// String literal 58 char + null terminator = 59
+// ============================================================
+__constant__ const char c_b58_alphabet[] = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 // SHA256 Constants
 __constant__ const uint32_t c_sha256_k[64] = {
@@ -74,7 +87,6 @@ __device__ __forceinline__ uint32_t sha2_sig0(uint32_t x) { return rotr(x, 7) ^ 
 __device__ __forceinline__ uint32_t sha2_sig1(uint32_t x) { return rotr(x, 17) ^ rotr(x, 19) ^ (x >> 10); }
 
 // SHA256 Transform (Single Block)
-// Assumes input data is already padded or fits in one block with padding logic inside
 __device__ void sha256_device(const uint8_t* data, size_t len, uint8_t hash[32]) {
     uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
     uint32_t w[64];
@@ -91,9 +103,6 @@ __device__ void sha256_device(const uint8_t* data, size_t len, uint8_t hash[32])
     w[len / 4] |= ((uint32_t)0x80) << (24 - (len % 4) * 8);
     
     // Length (bits) in the last 2 words
-    // Only handling lengths < 55 bytes for simplicity (Minikeys are ~30 chars)
-    // For Minikey validation (len+1 approx 32), fits in one block easily.
-    // For Private Key derivation (len=30..31), fits in one block.
     uint64_t bitLen = len * 8;
     w[14] = (uint32_t)(bitLen >> 32);
     w[15] = (uint32_t)bitLen;
@@ -182,8 +191,7 @@ __global__ void kernel_minikey_search(
 
         // Check if first byte is 0x00
         if (hash_check[0] != 0x00) {
-            // Invalid, skip (Probability 255/256)
-            // We still count this as an attempt for stats
+            // Invalid, skip
             if (++local_attempts >= 1024) {
                 if (lane == 0) atomicAdd(attempts_accum, (unsigned long long)local_attempts);
                 local_attempts = 0;
@@ -200,7 +208,6 @@ __global__ void kernel_minikey_search(
         // Convert BE bytes to LE 64-bit limbs for CUDAMath
         // SHA256 output is Big Endian. 
         // scalar[0] is lowest 64 bits of the number.
-        // Byte 31 is LSB. Byte 24 is MSB of limb 0.
         uint64_t scalar_le[4];
         scalar_le[0] = ((uint64_t)priv_key_bytes[31] << 0) | ((uint64_t)priv_key_bytes[30] << 8) |
                        ((uint64_t)priv_key_bytes[29] << 16) | ((uint64_t)priv_key_bytes[28] << 24) |
@@ -235,7 +242,7 @@ __global__ void kernel_minikey_search(
         local_attempts = 0;
 
         bool match = false;
-        // Check prefix first (fast reject)
+        // Check prefix first
         if (load_u32_le(h20) == c_target_prefix) {
             match = true;
             // Check full hash
@@ -282,7 +289,6 @@ int main(int argc, char** argv) {
 
     if (vanity_hash_hex.empty()) {
         std::cerr << "Usage: " << argv[0] << " --vanity-hash160 <hash> [--minikey-len 30]\n";
-        std::cerr << "Example: " << argv[0] << " --vanity-hash160 0000000000000000000000000000000000000000 --minikey-len 22\n";
         return EXIT_FAILURE;
     }
 
@@ -340,9 +346,8 @@ int main(int argc, char** argv) {
     std::cout << "======== SEARCH STARTED =========\n";
 
     int threads = 256;
-    int blocks = prop.multiProcessorCount * 4; // Use full GPU
+    int blocks = prop.multiProcessorCount * 4; 
 
-    // Seed based on time
     auto now = std::chrono::high_resolution_clock::now();
     uint64_t seed_high = (uint64_t)now.time_since_epoch().count();
 
