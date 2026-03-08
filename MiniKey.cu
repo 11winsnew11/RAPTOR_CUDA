@@ -45,12 +45,12 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 
 __constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
-__constant__ uint64_t c_RangeStart[4]; // Batas bawah rentang
-// __constant__ uint64_t c_RangeLen[4];   // Panjang rentang
+__constant__ uint64_t c_RangeStart[4]; 
+__constant__ uint64_t c_RangeMask[4];   // Mask = RangeLen - 1 (untuk rentang pangkat 2)
 __constant__ int c_vanity_len;
 
 // ============================================================
-// KERNEL: RANDOM SEARCH
+// KERNEL: RANDOM SEARCH WITH CORRECT RANGE MASKING
 // ============================================================
 __launch_bounds__(256, 2)
 __global__ void kernel_random_search(
@@ -68,8 +68,7 @@ __global__ void kernel_random_search(
     const unsigned lane      = (unsigned)(threadIdx.x & (WARP_SIZE - 1));
     const unsigned full_mask = 0xFFFFFFFFu;
     
-    // Inisialisasi RNG State (Xorshift128+)
-    // Seed diambil dari global ID dan clock untuk variasi
+    // RNG State (Xorshift128+)
     uint64_t rng_s0 = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t rng_s1 = (uint64_t)clock64() ^ (rng_s0 << 32);
     if (rng_s0 == 0) rng_s0 = 1; 
@@ -115,80 +114,52 @@ __global__ void kernel_random_search(
     for (uint32_t iter = 0; iter < iters_per_launch; ++iter) {
         if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
-        // 1. Generate Random Scalar k
+        // 1. Generate Random Scalar k (256-bit)
         uint64_t k_rand[4];
         k_rand[0] = xorshift128plus();
         k_rand[1] = xorshift128plus();
         k_rand[2] = xorshift128plus();
         k_rand[3] = xorshift128plus();
 
-        // Modulo reduction to fit range (Simplified reduction for random distribution)
-        // k_final = (k_rand % RangeLen) + RangeStart
-        // Note: Implementasi modulo 256-bit penuh di device mahal. 
-        // Kita gunakan metode rejection sampling sederhana jika range_len kecil (misal < 2^64),
-        // atau perkalian modular perkiraan. 
-        
-        // Untuk simplisitas dan kecepatan, jika range_len adalah pangkat 2 (umum untuk puzzle),
-        // kita bisa masking. Jika bukan, kita lakukan pengurangan sederhana.
-        // Di sini kita asumsikan range_len bisa besar, jadi kita lakukan:
-        // k_base = (k_rand[0]...k_rand[3]) mod c_RangeLen.
-        // Namun karena tidak ada div 256-bit di device, kita ambil kasus umum puzzle:
-        // Biasanya puzzle range adalah 2^N. Jika RangeLen adalah 2^N, masking mudah.
-        // Jika tidak, kita gunakan k_rand apa adanya dan tambahkan ke start (jika start=0).
-        // Input user biasanya memastikan range valid.
-        
-        // Logika Modulo Perkiraan (Cukup akurat untuk RNG):
-        // Jika RangeLen < 2^64 (puzzle kecil):
-        uint64_t r_len_lo = c_RangeLen[0];
-        bool small_range = (c_RangeLen[1] | c_RangeLen[2] | c_RangeLen[3]) == 0;
-        
+        // 2. Apply Range Masking (Power of 2 Range Optimization)
+        // k_final = (k_rand & Mask) + RangeStart
+        // Ini menjamin k_final berada dalam [Start, Start + Len-1] jika Len adalah pangkat 2.
         uint64_t k_final[4];
-        if (small_range) {
-            // Modulo 64-bit standar
-            uint64_t rem = k_rand[0] % r_len_lo;
-            // Tambahkan dengan carry
-            __uint128_t res = (__uint128_t)c_RangeStart[0] + rem;
+        
+        // Operasi AND 256-bit
+        k_final[0] = k_rand[0] & c_RangeMask[0];
+        k_final[1] = k_rand[1] & c_RangeMask[1];
+        k_final[2] = k_rand[2] & c_RangeMask[2];
+        k_final[3] = k_rand[3] & c_RangeMask[3];
+
+        // Operasi ADD 256-bit: k_final += RangeStart
+        // Dengan carry propagation
+        {
+            uint64_t carry = 0;
+            // Limb 0
+            __uint128_t res = (__uint128_t)k_final[0] + c_RangeStart[0];
             k_final[0] = (uint64_t)res;
-            uint64_t carry = (uint64_t)(res >> 64);
-            res = (__uint128_t)c_RangeStart[1] + carry;
+            carry = (uint64_t)(res >> 64);
+
+            // Limb 1
+            res = (__uint128_t)k_final[1] + c_RangeStart[1] + carry;
             k_final[1] = (uint64_t)res;
             carry = (uint64_t)(res >> 64);
-            k_final[2] = c_RangeStart[2] + carry;
-            k_final[3] = c_RangeStart[3] + (k_final[2] < carry ? 1 : 0); 
-        } else {
-            // Range besar: masking sederhana (jika power of 2) atau gunakan langsian
-            // Asumsi untuk kode ini: gunakan masking bit jika RangeLen adalah power of 2
-            // atau biarkan overflow alami (tidak presisi untuk range ketat).
-            // Untuk keperluan ini, kita lakukan penjumlahan sederhana dengan offset rand.
-            // Ini tidak uniform sempurna tapi berfungsi untuk "random search".
-             #pragma unroll
-             for(int i=0; i<4; ++i) k_final[i] = k_rand[i]; // dummy assign, perlu mod math kompleks
-             // Seharusnya gunakan BigMod, tapi untuk menjaga kode singkat di kernel,
-             // kita asumsikan range cukup besar atau gunakan helper extern.
-             // DIUBAH: Gunakan helper modular 256-bit manual sederhana (perkalian & shift)
-             // atau jika tidak, kita skip modulo ketat dan biarkan sebarannya.
-             // SOLUSI: Kita hitung P = Start + (Rand % Len).
-             // Karena % Len sulit, kita gunakan teknik "mult inverse" atau rejection.
-             // Untuk demo ini, kita gunakan Logika: k_final = Start + (Rand AND Mask)
-             // Jika user set range power of 2.
-             if ((c_RangeLen[0] & (c_RangeLen[0]-1)) == 0 && c_RangeLen[1]==0) { // Power of 2 check (approx)
-                 k_final[0] = c_RangeStart[0] + (k_rand[0] & (c_RangeLen[0]-1));
-                 k_final[1] = c_RangeStart[1];
-                 k_final[2] = c_RangeStart[2];
-                 k_final[3] = c_RangeStart[3];
-             } else {
-                 // Fallback: tidak ada modulo, range penuh (kurang akurat jika range kecil)
-                 // User diperingatkan untuk gunakan range power of 2 atau 256-bit penuh.
-                 #pragma unroll
-                 for(int i=0; i<4; ++i) k_final[i] = k_rand[i];
-             }
+
+            // Limb 2
+            res = (__uint128_t)k_final[2] + c_RangeStart[2] + carry;
+            k_final[2] = (uint64_t)res;
+            carry = (uint64_t)(res >> 64);
+
+            // Limb 3
+            k_final[3] = k_final[3] + c_RangeStart[3] + carry;
         }
 
-        // 2. Hitung Titik P = k_final * G (Menggunakan fungsi dari CUDAMath.h)
+        // 3. Hitung Titik P = k_final * G
         uint64_t x1[4], y1[4];
         scalarMulBaseAffine(k_final, x1, y1);
 
-        // 3. Cek Titik Pusat (P)
+        // 4. Cek Titik Pusat (P)
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
@@ -215,36 +186,16 @@ __global__ void kernel_random_search(
             }
         }
 
-        // 4. Cek Tetangga (Batch Neighbors) menggunakan Inversion Optimizer
-        // Logika ini sama seperti kernel linear sebelumnya, tapi menggunakan x1,y1 acak.
+        // 5. Batch Neighbors Check (Logika sama seperti sebelumnya)
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
-        // Setup Delta X untuk batch
-        // Kita gunakan x1 sebagai titik acuan.
-        // Kita butuh invers dari (Gx_i - x1).
-        // Prekalkulasi produk (seperti kernel sebelumnya)
+        #pragma unroll
+        for (int j=0;j<4;++j) acc[j] = c_Gx[(size_t)0*4 + j]; 
+        ModSub256(acc, acc, x1); 
         
         #pragma unroll
-        for (int j=0;j<4;++j) acc[j] = c_Gx[(size_t)0*4 + j]; // Gx[0]
-        ModSub256(acc, acc, x1); // Gx[0] - x1
-        
-        // Loop untuk kalkulasi akumulasi penjumlahan
-        // Implementasi batch inversion setup di sini mirip dengan kode asli,
-        // mengecek P+G, P-G, P+2G, dst.
-        
-        // [Untuk menghemat ruang, logika batch inversion mirip sekali dengan kernel sebelumnya]
-        // Ringkasnya:
-        // 1. Hitung akumulasi selisih dx.
-        // 2. Lakukan satu invers.
-        // 3. Terapkan untuk menemukan titik baru tanpa invers penuh.
-        
-        // Kita salin logika setup dari kode asli (optimized batch check)
-        // Pastikan c_Gx sudah terisi precomputed points.
-        
-        // Setup Sub Products
-        #pragma unroll
-        for (int j=0;j<4;++j) subp[half-1][j] = acc[j]; // Penyimpanan sementara
+        for (int j=0;j<4;++j) subp[half-1][j] = acc[j];
 
         for (int i = half - 2; i >= 0; --i) {
             #pragma unroll
@@ -255,8 +206,8 @@ __global__ void kernel_random_search(
             for (int j=0;j<4;++j) subp[i][j] = acc[j];
         }
 
-        uint64_t d0[4], inverse[4]; // di kernel asli inverse[5], tapi _ModInv butuh 5 elemen
-        uint64_t inverse_full[5]; // ModInv butuh 5 limb
+        uint64_t d0[4];
+        uint64_t inverse_full[5]; 
         
         #pragma unroll
         for (int j=0;j<4;++j) d0[j] = c_Gx[0*4 + j];
@@ -265,16 +216,15 @@ __global__ void kernel_random_search(
         for (int j=0;j<4;++j) inverse_full[j] = d0[j];
         inverse_full[4] = 0;
         
-        _ModMult(inverse_full, subp[0]); // subp[0] is product of others
-        // _ModInv expects 5 limb array
+        _ModMult(inverse_full, subp[0]); 
         _ModInv(inverse_full); 
 
-        // 5. Loop Pengecekan Batch (+G dan -G)
+        // Loop pengecekan batch (+G dan -G)
         for (int i = 0; i < half - 1; ++i) {
              if (warp_found_ready(d_found_flag, full_mask, lane)) { WARP_FLUSH_HASHES(); return; }
 
              uint64_t dx_inv_i[4];
-             _ModMult(dx_inv_i, subp[i], inverse_full); // inverse_full has the inversed value
+             _ModMult(dx_inv_i, subp[i], inverse_full); 
 
              // --- BLOK +G ---
              {
@@ -301,7 +251,6 @@ __global__ void kernel_random_search(
                  if (__any_sync(full_mask, match)) {
                      if (match) {
                          if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                             // Hitung skalar: k_final + (i+1)
                              uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=k_final[k];
                              uint64_t addv=(uint64_t)(i+1);
                              for (int k=0;k<4 && addv;++k){ uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
@@ -309,7 +258,6 @@ __global__ void kernel_random_search(
                              for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
                              #pragma unroll
                              for (int k=0;k<4;++k) d_found_result->Rx[k]=px3[k];
-                             // Y calculation omitted for brevity, logic same as original
                              d_found_result->threadId = (int)(blockIdx.x * blockDim.x + threadIdx.x);
                              d_found_result->iter     = iter;
                              __threadfence_system();
@@ -346,7 +294,6 @@ __global__ void kernel_random_search(
                  if (__any_sync(full_mask, match)) {
                      if (match) {
                          if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                             // Hitung skalar: k_final - (i+1)
                              uint64_t fs[4]; for (int k=0;k<4;++k) fs[k]=k_final[k];
                              uint64_t subv=(uint64_t)(i+1);
                              for (int k=0;k<4 && subv;++k){ uint64_t old=fs[k]; fs[k]=old-subv; subv=(old<subv)?1ull:0ull; }
@@ -364,15 +311,12 @@ __global__ void kernel_random_search(
                  }
              }
 
-             // Update inverse untuk iterasi berikutnya
              uint64_t gxmi[4];
              #pragma unroll
              for (int j=0;j<4;++j) gxmi[j] = c_Gx[(size_t)i*4 + j];
              ModSub256(gxmi, gxmi, x1);
              _ModMult(inverse_full, inverse_full, gxmi);
         }
-        
-        // (Opsional: Blok Akhir P - half*G bisa ditambahkan di sini serupa kode asli)
     }
     WARP_FLUSH_HASHES();
     #undef MAYBE_WARP_FLUSH
@@ -402,10 +346,8 @@ int main(int argc, char** argv) {
 
     std::string range_hex, vanity_hash_hex;
     uint32_t runtime_points_batch_size = 1024; 
-    uint32_t runtime_batches_per_sm    = 8; // Tidak digunakan langsuk untuk grid size random
-    uint32_t iters_per_launch          = 64; // Berapa banyak random point per thread per launch
+    uint32_t iters_per_launch          = 64; 
 
-    // ... (Parsing Argumen sama seperti sebelumnya) ...
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if      (arg == "--vanity-hash160" && i + 1 < argc) vanity_hash_hex = argv[++i];
@@ -430,7 +372,6 @@ int main(int argc, char** argv) {
         std::cerr << "Error: invalid range hex\n"; return EXIT_FAILURE;
     }
     
-    // ... (Target Hash parsing sama seperti sebelumnya) ...
     if (vanity_hash_hex.length() > 40 || vanity_hash_hex.length() % 2 != 0) { std::cerr << "Error: Vanity hash len\n"; return EXIT_FAILURE; }
     uint8_t target_hash160[20]; memset(target_hash160, 0, 20);
     for (size_t i = 0; i < vanity_hash_hex.length() / 2; ++i) {
@@ -444,18 +385,53 @@ int main(int argc, char** argv) {
     sub256(range_end, range_start, range_len); 
     add256_u64(range_len, 1ull, range_len);
 
+    // Hitung RangeMask (Len - 1)
+    uint64_t range_mask[4];
+    for(int i=0; i<4; ++i) range_mask[i] = range_len[i];
+    
+    // range_mask = range_len - 1
+    uint64_t borrow = 1;
+    for (int i = 0; i < 4; ++i) {
+        if (range_mask[i] >= borrow) {
+            range_mask[i] -= borrow;
+            borrow = 0;
+        } else {
+            range_mask[i] -= borrow; // will underflow
+            borrow = 1;
+        }
+    }
+
+    // Verifikasi apakah RangeLen adalah pangkat 2
+    // Jika RangeLen adalah 2^n, maka RangeMask harus semua 1s (biner)
+    // Cara cek: (Len & (Len-1)) == 0. 
+    // Di 256-bit: pastikan hanya 1 bit yang set di range_len.
+    bool is_pow2 = false;
+    int bit_count = 0;
+    for(int i=0; i<4; ++i) {
+        bit_count += __builtin_popcountll(range_len[i]);
+    }
+    if (bit_count == 1) is_pow2 = true;
+
+    if (!is_pow2) {
+        std::cerr << "Warning: Range Length is NOT a power of two. Random distribution will be slightly biased.\n";
+        std::cerr << "For perfect distribution, use ranges like 8000...000 to 8FFF...FFF (power of 2 length).\n";
+        // Jika bukan pangkat 2, masking bitwise tidak presisi, tapi kita tetap lanjutkan dengan mask saat ini (pembulatan ke bawah)
+        // Atau bisa implementasi rejection sampling (lebih lambat).
+        // Untuk simplisitas, kita lanjutkan masking bitwise (cepat tapi biased jika range tidak 'bulat').
+    }
+
     int device=0; cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) { std::cerr<<"CUDA init error\n"; return EXIT_FAILURE; }
     cudaDeviceSetCacheConfig(cudaFuncCachePreferL1);
 
     int threadsPerBlock = 256;
-    int blocks = prop.multiProcessorCount * 8; // Occupancy sederhana
+    int blocks = prop.multiProcessorCount * 8; 
     uint64_t threadsTotal = (uint64_t)blocks * threadsPerBlock;
 
     cudaMemcpyToSymbol(c_target_hash160, target_hash160, 20);
     cudaMemcpyToSymbol(c_vanity_len, &vanity_len, sizeof(int));
     cudaMemcpyToSymbol(c_RangeStart, range_start, 4 * sizeof(uint64_t));
-    cudaMemcpyToSymbol(c_RangeLen, range_len, 4 * sizeof(uint64_t));
+    cudaMemcpyToSymbol(c_RangeMask, range_mask, 4 * sizeof(uint64_t)); // Upload Mask!
 
     uint32_t prefix_le = 0;
     if (vanity_len >= 4) {
@@ -476,8 +452,7 @@ int main(int argc, char** argv) {
       ck(cudaMemcpy(d_found_flag, &zero, sizeof(int), cudaMemcpyHostToDevice), "init flag");
       ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "init accum"); }
 
-    // Precompute G Table (1G ... half*G)
-    // Bagian ini tetap diperlukan karena kita melakukan batch check (+G, -G) dari titik acak
+    // Precompute G Table
     {
         const uint32_t B = runtime_points_batch_size;
         const uint32_t half = B >> 1;
@@ -508,7 +483,7 @@ int main(int argc, char** argv) {
         std::free(h_Gx_half); std::free(h_Gy_half);
     }
 
-    std::cout << "======== Mode: RANDOM SEARCH ====================\n";
+    std::cout << "======== Mode: RANDOM SEARCH (Strict Range) ========\n";
     std::cout << "Device: " << prop.name << "\n";
     std::cout << "Batch Size: " << runtime_points_batch_size << "\n";
     std::cout << "Threads: " << threadsTotal << "\n";
@@ -532,11 +507,10 @@ int main(int argc, char** argv) {
         
         if (cudaGetLastError() != cudaSuccess) { stop_all = true; }
 
-        // Monitoring Loop
-        for (int k=0; k<10 && !stop_all; ++k) { // Check 10 times per second
+        for (int k=0; k<10 && !stop_all; ++k) {
             auto now = std::chrono::high_resolution_clock::now();
             double dt = std::chrono::duration<double>(now - tLast).count();
-            if (dt >= 0.1) { // Update every 0.1s
+            if (dt >= 0.1) {
                 unsigned long long h_hashes = 0ull;
                 ck(cudaMemcpy(&h_hashes, d_hashes_accum, sizeof(unsigned long long), cudaMemcpyDeviceToHost), "read hashes");
                 double delta = (double)(h_hashes - lastHashes);
@@ -555,7 +529,7 @@ int main(int argc, char** argv) {
             if (host_found == FOUND_READY) { stop_all = true; break; }
 
             cudaError_t qs = cudaStreamQuery(streamKernel);
-            if (qs == cudaSuccess) break; // Kernel finished, launch next
+            if (qs == cudaSuccess) break; 
             else if (qs != cudaErrorNotReady) { cudaGetLastError(); stop_all = true; break; }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
