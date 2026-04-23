@@ -792,22 +792,35 @@ int main(int argc, char** argv) {
     // --- INISIALISASI SCALAR (RANDOM START VS LINEAR) ---------
     // ==========================================================
     if (random_mode) {
-        std::cout << "Applying Random Start logic (XOR Shuffle)...\n";
+        std::cout << "Applying EXTREME Random Logic (Golden Ratio Jumps)...\n";
+        
+        const uint64_t PHI = 0x9e3779b97f4a7c15ULL; 
+        
+        // Seed awal
+        uint64_t current_hash = random_seed;
+
         for (uint64_t i = 0; i < threadsTotal; ++i) {
-            // Acak urutan chunk yang diproses oleh thread ini
-            uint64_t mask = threadsTotal - 1;
-            uint64_t scrambled_idx = i ^ (random_seed & mask);
+            // 1. Generate Pseudo-Random Offset menggunakan SplitMix64
+            current_hash += PHI;
+            uint64_t z = current_hash;
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+            uint64_t rand_idx = z ^ (z >> 31);
             
-            uint64_t offset_scalar[4] = {0,0,0,0};
-            mul256_u64(per_thread_cnt, scrambled_idx, offset_scalar);
+            // 2. Map ke Range (Modulo Arithmetic 256-bit)
+            // rand_idx sudah 64-bit, kita map ke total chunks
+            uint64_t total_chunks = total_batches_u64; 
+            uint64_t target_chunk = rand_idx % total_chunks; // Simplified, gunakan mul128 untuk presisi tinggi
+
+            // 3. Hitung Scalar Awal
+            uint64_t offset_scalar[4];
+            mul256_u64(per_thread_cnt, target_chunk, offset_scalar); // offset = target_chunk * chunk_size
             
-            uint64_t temp_scalar[4];
-            add256(range_start, offset_scalar, temp_scalar);
-            
-            // Tambahkan 'half' untuk center point (opsional, tapi konsisten dengan sebelumnya)
             uint64_t Sc[4];
-            add256_u64(temp_scalar, (uint64_t)half, Sc);
-            
+            add256(range_start, offset_scalar, Sc); // Sc = RangeStart + offset
+            add256_u64(Sc, (uint64_t)half, Sc);     // Center point adjustment
+
+            // 4. Assign ke Thread
             h_start_scalars[i*4+0] = Sc[0];
             h_start_scalars[i*4+1] = Sc[1];
             h_start_scalars[i*4+2] = Sc[2];
