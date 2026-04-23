@@ -46,16 +46,16 @@ __device__ __forceinline__ bool warp_found_ready(const int* __restrict__ d_found
 #define WARP_SIZE 32
 #endif
 
-// --- MODIFIKASI: Tambah Constant Memory untuk Scalar Acak ---
-// Ukuran: MAX_BATCH_SIZE/2 * 4 limb * 8 byte = 16KB (cukup di dalam 64KB limit)
+// Constant Memory untuk menyimpan titik referensi G * delta
+// Ukuran: MAX_BATCH_SIZE/2 * 4 limb * 8 byte = 16KB
 __constant__ uint64_t c_Gx[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Gy[(MAX_BATCH_SIZE/2) * 4];
 __constant__ uint64_t c_Jx[4];
 __constant__ uint64_t c_Jy[4];
 
-// Menyimpan scalar delta untuk setiap titik di batch (untuk menghitung Private Key)
+// Menyimpan scalar delta untuk setiap titik di batch
 __constant__ uint64_t c_deltas[(MAX_BATCH_SIZE/2) * 4]; 
-// Menyimpan scalar delta untuk lompatan (untuk update S loop berikutnya)
+// Menyimpan scalar delta untuk lompatan antar batch
 __constant__ uint64_t c_J_delta[4]; 
 
 __constant__ uint32_t c_vanity_len;
@@ -175,7 +175,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                         d_found_result->threadId = (int)gid;
                         d_found_result->iter     = 0;
 #pragma unroll
-                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k]; // Base Scalar
+                        for (int k=0;k<4;++k) d_found_result->scalar[k]=S[k]; 
 #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->Rx[k]=x1[k];
 #pragma unroll
@@ -222,7 +222,6 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // Load Delta Scalar untuk indeks i ini
             uint64_t current_delta[4];
             #pragma unroll
             for (int k=0; k<4; ++k) current_delta[k] = c_deltas[(size_t)i*4 + k];
@@ -264,7 +263,6 @@ __global__ void kernel_point_add_and_check_oneinv(
                     if (full_match) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             uint64_t fs[4]; 
-                            // Hitung S_final = S + delta
                             add256_with_carry(S, current_delta, fs);
                             
 #pragma unroll
@@ -323,7 +321,6 @@ __global__ void kernel_point_add_and_check_oneinv(
                     if (full_match) {
                         if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
                             uint64_t fs[4]; 
-                            // Hitung S_final = S - delta
                             sub256_with_borrow(S, current_delta, fs);
 
 #pragma unroll
@@ -391,13 +388,12 @@ __global__ void kernel_point_add_and_check_oneinv(
                 
                 if (full_match) {
                     if (atomicCAS(d_found_flag, FOUND_NONE, FOUND_LOCK) == FOUND_NONE) {
-                        // Load Delta
                          uint64_t current_delta[4];
                         #pragma unroll
                         for (int k=0; k<4; ++k) current_delta[k] = c_deltas[(size_t)i*4 + k];
 
                         uint64_t fs[4]; 
-                        sub256_with_borrow(S, current_delta, fs); // S - delta
+                        sub256_with_borrow(S, current_delta, fs); 
 
 #pragma unroll
                         for (int k=0;k<4;++k) d_found_result->scalar[k]=fs[k];
@@ -422,7 +418,7 @@ __global__ void kernel_point_add_and_check_oneinv(
             _ModMult(inverse, inverse, last_dx);
         }
 
-        // Jump Logic (Random or Fixed)
+        // Jump Logic (Fixed Linear Jump to stay in range logic)
         {
             uint64_t lam[4], s[4], x3[4], y3[4];
 
@@ -445,9 +441,9 @@ __global__ void kernel_point_add_and_check_oneinv(
             for (int j=0;j<4;++j) { x1[j] = x3[j]; y1[j] = y3[j]; }
         }
 
-        // Update Scalar S (Random or Fixed)
+        // Update Scalar S (Fixed Linear Update)
         {
-            // S = S + c_J_delta
+            // S = S + c_J_delta (Batch Size)
             uint64_t carry = 0;
             #pragma unroll
             for (int k=0;k<4;++k) {
@@ -455,7 +451,7 @@ __global__ void kernel_point_add_and_check_oneinv(
                 S[k] = (uint64_t)res;
                 carry = (uint64_t)(res >> 64);
             }
-            sub256_u64_inplace(rem, (uint64_t)B); // Kurangi sisa hitungan (quota)
+            sub256_u64_inplace(rem, (uint64_t)B); 
         }
         ++batches_done;
     }
@@ -477,7 +473,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     #undef FLUSH_THRESHOLD
 }
 
-// ... (Helper functions host tetap sama) ...
+// ... (Helper functions host) ...
 extern bool hexToLE64(const std::string& h_in, uint64_t w[4]);
 extern bool hexToHash160(const std::string& h, uint8_t hash160[20]);
 extern std::string formatHex256(const uint64_t limbs[4]);
@@ -495,16 +491,6 @@ void mul256_u64(const uint64_t a[4], uint64_t b, uint64_t r[4]) {
     res = (unsigned __int128)a[3] * b + carry; r[3] = (uint64_t)res;
 }
 
-// Helper untuk generate random 256-bit
-void random_256bit(std::mt19937_64& gen, uint64_t out[4]) {
-    std::uniform_int_distribution<uint64_t> dis(0, UINT64_MAX);
-    out[0] = dis(gen);
-    out[1] = dis(gen);
-    out[2] = dis(gen);
-    out[3] = dis(gen);
-    // Pastikan < N (order kurva) jika perlu presisi absolut, tapi untuk random search rough ok.
-}
-
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
@@ -516,6 +502,7 @@ int main(int argc, char** argv) {
     bool random_mode = false;
     uint64_t random_seed = 0;
 
+    // Parsing logic (same as before)
     auto parse_grid = [](const std::string& s, uint32_t& a_out, uint32_t& b_out)->bool {
         size_t comma = s.find(',');
         if (comma == std::string::npos) return false;
@@ -579,7 +566,7 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // ... (Parsing vanity & range tetap sama) ...
+    // ... (Parsing vanity & range validation) ...
     if (vanity_hex.length() > 40) { std::cerr << "Error: Vanity prefix too long.\n"; return EXIT_FAILURE; }
     if (vanity_hex.length() % 2 != 0) { std::cerr << "Error: Vanity prefix length must be even.\n"; return EXIT_FAILURE; }
 
@@ -593,8 +580,9 @@ int main(int argc, char** argv) {
     if (vanity_len < 4) vanity_prefix_mask = (1ULL << (vanity_len * 8)) - 1;
 
     if(random_mode) {
-        std::cout << "======= MODE: STOCHASTIC CLOUD HUNTING ========\n";
+        std::cout << "======= MODE: RANDOM PERMUTATION SEARCH ========\n";
         std::cout << "Seed: " << std::hex << random_seed << std::dec << "\n";
+        std::cout << "Search order is randomized, but strictly within range.\n";
     }
 
     size_t colon_pos = range_hex.find(':');
@@ -619,6 +607,7 @@ int main(int argc, char** argv) {
 
     uint64_t range_len[4]; sub256(range_end, range_start, range_len); add256_u64(range_len, 1ull, range_len);
 
+    // ... (Range validation logic remains same) ...
     auto is_zero_256 = [](const uint64_t a[4])->bool { return (a[0]|a[1]|a[2]|a[3]) == 0ull; };
     auto is_power_of_two_256 = [&](const uint64_t a[4])->bool {
         if (is_zero_256(a)) return false;
@@ -634,6 +623,7 @@ int main(int argc, char** argv) {
         std::cerr << "Error: range length (end - start + 1) must be a power of two.\n"; return EXIT_FAILURE;
     }
     
+    // ... (Alignment check) ...
     uint64_t len_minus1[4];
     {   uint64_t borrow=1ull;
         for (int i=0;i<4;++i) {
@@ -662,7 +652,7 @@ int main(int argc, char** argv) {
     if (threadsPerBlock > (int)prop.maxThreadsPerBlock) threadsPerBlock=prop.maxThreadsPerBlock;
     if (threadsPerBlock < 32) threadsPerBlock=32;
 
-    const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t); // Px, Py storage roughly
+    const uint64_t bytesPerThread = 2ull*4ull*sizeof(uint64_t); 
     size_t totalGlobalMem = prop.totalGlobalMem;
     const uint64_t reserveBytes = 64ull * 1024 * 1024;
     uint64_t usableMem = (totalGlobalMem > reserveBytes) ? (totalGlobalMem - reserveBytes) : (totalGlobalMem / 2);
@@ -681,7 +671,6 @@ int main(int argc, char** argv) {
     uint64_t userUpper = (uint64_t)prop.multiProcessorCount * (uint64_t)runtime_batches_per_sm * (uint64_t)threadsPerBlock;
     if (userUpper == 0ull) userUpper = UINT64_MAX;
 
-    // --- Penentuan threadsTotal (Power of 2) ---
     auto pick_threads_total_pow2 = [&](uint64_t upper)->uint64_t {
         if (upper < (uint64_t)threadsPerBlock) return 0ull;
         uint64_t t = upper - (upper % (uint64_t)threadsPerBlock);
@@ -720,7 +709,6 @@ int main(int argc, char** argv) {
         if (rr != 0ull) { std::cerr << "Internal error: per-thread count is not a multiple of batch size.\n"; return EXIT_FAILURE; }
     }
 
-    // Inisialisasi RNG
     std::mt19937_64 rng(random_seed);
 
     uint64_t* h_counts256     = nullptr;
@@ -739,50 +727,35 @@ int main(int argc, char** argv) {
     const uint32_t half = B >> 1;
 
     // ==========================================================
-    // --- PRECOMPUTATION DENGAN LOGIKA RANDOM MIND-BLOWING -----
+    // --- PRECOMPUTATION: LINEAR INCREMENT (RANGE SAFE) -------
     // ==========================================================
-
-    // 1. Siapkan Buffer Host untuk Delta Scalars
+    
+    // Untuk menjaga agar pencarian tetap dalam range, kita menggunakan delta kecil (1, 2, 3...)
+    // baik dalam mode random maupun linear. Randomisasi hanya dilakukan pada titik awal.
+    
     uint64_t* h_batch_deltas = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
     uint64_t h_jump_delta[4] = {0,0,0,0};
 
-    if (random_mode) {
-        std::cout << "Generating Stochastic Cloud Batch (Size " << half << ")...\n";
-        
-        // Isi dengan scalar acak
-        for (uint32_t i = 0; i < half; ++i) {
-            random_256bit(rng, &h_batch_deltas[(size_t)i*4]);
-        }
-        
-        // Isi Jump Delta dengan scalar acak
-        random_256bit(rng, h_jump_delta);
-        std::cout << "Random Jump Delta Generated.\n";
-
-    } else {
-        // Mode Linear (Perilaku standar)
-        for (uint32_t i = 0; i < half; ++i) {
-            std::memset(&h_batch_deltas[(size_t)i*4], 0, 4*sizeof(uint64_t));
-            h_batch_deltas[(size_t)i*4 + 0] = (uint64_t)(i + 1); // 1, 2, 3...
-        }
-        // Jump Delta = B
-        h_jump_delta[0] = B; 
+    // Selalu gunakan delta linear: 1, 2, 3, ... half
+    for (uint32_t i = 0; i < half; ++i) {
+        std::memset(&h_batch_deltas[(size_t)i*4], 0, 4*sizeof(uint64_t));
+        h_batch_deltas[(size_t)i*4 + 0] = (uint64_t)(i + 1); 
     }
+    // Jump Delta = Batch Size (inkremen linier antar loop)
+    h_jump_delta[0] = B; 
 
-    // 2. Hitung Titik G * Delta (Points) di GPU
+    // 2. Hitung Titik G * Delta di GPU
     uint64_t *d_delta_scalars, *d_temp_Gx, *d_temp_Gy;
     cudaMalloc(&d_delta_scalars, (size_t)half * 4 * sizeof(uint64_t));
     cudaMalloc(&d_temp_Gx, (size_t)half * 4 * sizeof(uint64_t));
     cudaMalloc(&d_temp_Gy, (size_t)half * 4 * sizeof(uint64_t));
 
-    // Copy deltas to device
     cudaMemcpy(d_delta_scalars, h_batch_deltas, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyHostToDevice);
 
-    // Launch Kernel untuk hitung Titik
     int blocks_scal = (half + 255) / 256;
     scalarMulKernelBase<<<blocks_scal, 256>>>(d_delta_scalars, d_temp_Gx, d_temp_Gy, half);
     cudaDeviceSynchronize();
 
-    // Copy Hasil Titik ke Constant Memory (c_Gx, c_Gy)
     uint64_t* h_temp_Gx = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
     uint64_t* h_temp_Gy = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
     cudaMemcpy(h_temp_Gx, d_temp_Gx, (size_t)half * 4 * sizeof(uint64_t), cudaMemcpyDeviceToHost);
@@ -790,8 +763,6 @@ int main(int argc, char** argv) {
     
     cudaMemcpyToSymbol(c_Gx, h_temp_Gx, (size_t)half * 4 * sizeof(uint64_t));
     cudaMemcpyToSymbol(c_Gy, h_temp_Gy, (size_t)half * 4 * sizeof(uint64_t));
-
-    // Copy Delta Scalars ke Constant Memory (c_deltas)
     cudaMemcpyToSymbol(c_deltas, h_batch_deltas, (size_t)half * 4 * sizeof(uint64_t));
 
     // 3. Hitung Titik Jump (J) dan Delta-nya
@@ -818,11 +789,12 @@ int main(int argc, char** argv) {
     cudaFree(d_jump_scalar); cudaFree(d_temp_Jx); cudaFree(d_temp_Jy);
 
     // ==========================================================
-    // --- INISIALISASI SCALAR (RANDOM vs LINEAR) ---------------
+    // --- INISIALISASI SCALAR (RANDOM START VS LINEAR) ---------
     // ==========================================================
     if (random_mode) {
-        std::cout << "Applying XOR Shuffle mapping for start points...\n";
+        std::cout << "Applying Random Start logic (XOR Shuffle)...\n";
         for (uint64_t i = 0; i < threadsTotal; ++i) {
+            // Acak urutan chunk yang diproses oleh thread ini
             uint64_t mask = threadsTotal - 1;
             uint64_t scrambled_idx = i ^ (random_seed & mask);
             
@@ -832,9 +804,7 @@ int main(int argc, char** argv) {
             uint64_t temp_scalar[4];
             add256(range_start, offset_scalar, temp_scalar);
             
-            // Sesuaikan dengan half (kernel logic requires +half for center point)
-            // Namun karena batch sekarang acak, +half tidak terlalu kritis untuk koordinat,
-            // tapi penting untuk konsistensi scalar.
+            // Tambahkan 'half' untuk center point (opsional, tapi konsisten dengan sebelumnya)
             uint64_t Sc[4];
             add256_u64(temp_scalar, (uint64_t)half, Sc);
             
@@ -844,6 +814,7 @@ int main(int argc, char** argv) {
             h_start_scalars[i*4+3] = Sc[3];
         }
     } else {
+        // Mode Linear: Thread 0 ambil chunk 0, Thread 1 ambil chunk 1, dst.
         uint64_t cur[4] = { range_start[0], range_start[1], range_start[2], range_start[3] };
         for (uint64_t i = 0; i < threadsTotal; ++i) {
             uint64_t Sc[4]; add256_u64(cur, (uint64_t)half, Sc); 
@@ -857,6 +828,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ... (Rest of main: Copy target, Malloc, Kernel Launch logic remains the same) ...
     // Copy Target and Vanity Config
     {
         uint32_t prefix_le = (uint32_t)target_hash160[0]
