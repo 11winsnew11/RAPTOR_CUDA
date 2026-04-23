@@ -84,90 +84,6 @@ __device__ void sub256_with_borrow(const uint64_t a[4], const uint64_t b[4], uin
     }
 }
 
-// ==========================================================
-// --- EXTREME RANDOM MATH: FEISTEL CIPHER (HOST SIDE) ------
-// ==========================================================
-
-// Fungsi Hash non-linear untuk Feistel Round (Menggunakan konstanta golden ratio)
-// Menggunakan xorshift untuk mixing yang kuat
-__host__ __forceinline__ uint32_t feistel_round_func(uint32_t val, uint64_t seed) {
-    val ^= (val >> 17);
-    val ^= (uint32_t)(seed >> 32);
-    val *= 0xed5ad4bb;
-    val ^= (val >> 11);
-    val ^= (uint32_t)(seed & 0xFFFFFFFF);
-    val *= 0xac4c1b51;
-    val ^= (val >> 15);
-    val *= 0x31848bab;
-    val ^= (val >> 14);
-    return val;
-}
-
-// Permutasi Bit-Width Variable menggunakan 4-Rounds Feistel Network
-// Ini adalah "Kotak Kaca Kriptografis": Input unik -> Output unik dalam range [0, N-1]
-// Menjamin Bijection (Zero Collision) dan Avalanche Effect (Extreme Randomness)
-__host__ __forceinline__ uint64_t permute_index_feistel(uint64_t index, uint64_t threadsTotal, uint64_t seed) {
-    if (threadsTotal <= 1) return 0;
-
-    // 1. Hitung bit-width (K) yang dibutuhkan untuk mencover threadsTotal
-    // threadsTotal dijamin power of 2 oleh logika main(), jadi kita bisa gunakan bit manipulation
-    int k = 0;
-    uint64_t temp = threadsTotal;
-    while (temp > 1) { temp >>= 1; k++; }
-    
-    // Kasus khusus jika threadsTotal = 2^64
-    if (k == 64) {
-        uint32_t L = (uint32_t)(index >> 32);
-        uint32_t R = (uint32_t)(index & 0xFFFFFFFFULL);
-        
-        // 4 Rounds Feistel standar untuk 64-bit
-        uint32_t tmp;
-        tmp = R; R = L ^ feistel_round_func(R, seed); L = tmp;
-        tmp = R; R = L ^ feistel_round_func(R, seed ^ 0xDEADBEEF); L = tmp;
-        tmp = R; R = L ^ feistel_round_func(R, seed ^ 0xBADC0FFE); L = tmp;
-        tmp = R; R = L ^ feistel_round_func(R, seed ^ 0xC0FFEE99); L = tmp;
-        
-        return (((uint64_t)L) << 32) | (uint64_t)R;
-    }
-
-    // 2. Implementasi Feistel Variable Bit-Width
-    // Kita bagi K bit menjadi L_bits dan R_bits
-    int half_k = k / 2;
-    uint32_t maskR = (1ULL << half_k) - 1;
-    uint32_t maskL = (1ULL << (k - half_k)) - 1;
-
-    uint32_t L = (uint32_t)(index >> half_k) & maskL;
-    uint32_t R = (uint32_t)(index & maskR);
-
-    // 4 Rounds Feistel dengan Masking (Memastikan output tetap dalam range bit)
-    // Perhatikan: Lebar bit L dan R mungkin berbeda (misal k=20 -> L=10, R=10)
-    
-    // Round 1: L baru = R lama, R baru = L lama ^ F(R lama)
-    uint32_t tmp;
-    tmp = R;
-    R = (L ^ feistel_round_func(R, seed)) & maskL; // Output harus di-mask ke lebar L
-    L = tmp;
-    
-    // Round 2: Swap roles (L sekarang berukuran R, R sekarang berukuran L)
-    // Fungsi F mengambil input ukuran L, menghasilkan output ukuran R
-    tmp = R;
-    R = (L ^ feistel_round_func(R, seed ^ 0xAAAA)) & maskR; 
-    L = tmp;
-
-    // Round 3
-    tmp = R;
-    R = (L ^ feistel_round_func(R, seed ^ 0xBBBB)) & maskL;
-    L = tmp;
-
-    // Round 4
-    tmp = R;
-    R = (L ^ feistel_round_func(R, seed ^ 0xCCCC)) & maskR;
-    L = tmp;
-
-    return (((uint64_t)L) << half_k) | (uint64_t)R;
-}
-
-// ... (Kernel device code tetap sama persis, tidak perlu diubah) ...
 __launch_bounds__(256, 2)
 __global__ void kernel_point_add_and_check_oneinv(
     const uint64_t* __restrict__ Px,
@@ -664,9 +580,9 @@ int main(int argc, char** argv) {
     if (vanity_len < 4) vanity_prefix_mask = (1ULL << (vanity_len * 8)) - 1;
 
     if(random_mode) {
-        std::cout << "======= MODE: EXTREME QUANTUM PERMUTATION SEARCH ========\n";
+        std::cout << "======= MODE: RANDOM PERMUTATION SEARCH ========\n";
         std::cout << "Seed: " << std::hex << random_seed << std::dec << "\n";
-        std::cout << "Applying Format-Preserving Encryption (Feistel Network) for bijection.\n";
+        std::cout << "Search order is randomized, but strictly within range.\n";
     }
 
     size_t colon_pos = range_hex.find(':');
@@ -814,15 +730,21 @@ int main(int argc, char** argv) {
     // --- PRECOMPUTATION: LINEAR INCREMENT (RANGE SAFE) -------
     // ==========================================================
     
+    // Untuk menjaga agar pencarian tetap dalam range, kita menggunakan delta kecil (1, 2, 3...)
+    // baik dalam mode random maupun linear. Randomisasi hanya dilakukan pada titik awal.
+    
     uint64_t* h_batch_deltas = (uint64_t*)std::malloc((size_t)half * 4 * sizeof(uint64_t));
     uint64_t h_jump_delta[4] = {0,0,0,0};
 
+    // Selalu gunakan delta linear: 1, 2, 3, ... half
     for (uint32_t i = 0; i < half; ++i) {
         std::memset(&h_batch_deltas[(size_t)i*4], 0, 4*sizeof(uint64_t));
         h_batch_deltas[(size_t)i*4 + 0] = (uint64_t)(i + 1); 
     }
+    // Jump Delta = Batch Size (inkremen linier antar loop)
     h_jump_delta[0] = B; 
 
+    // 2. Hitung Titik G * Delta di GPU
     uint64_t *d_delta_scalars, *d_temp_Gx, *d_temp_Gy;
     cudaMalloc(&d_delta_scalars, (size_t)half * 4 * sizeof(uint64_t));
     cudaMalloc(&d_temp_Gx, (size_t)half * 4 * sizeof(uint64_t));
@@ -843,6 +765,7 @@ int main(int argc, char** argv) {
     cudaMemcpyToSymbol(c_Gy, h_temp_Gy, (size_t)half * 4 * sizeof(uint64_t));
     cudaMemcpyToSymbol(c_deltas, h_batch_deltas, (size_t)half * 4 * sizeof(uint64_t));
 
+    // 3. Hitung Titik Jump (J) dan Delta-nya
     uint64_t *d_jump_scalar, *d_temp_Jx, *d_temp_Jy;
     cudaMalloc(&d_jump_scalar, 4 * sizeof(uint64_t));
     cudaMalloc(&d_temp_Jx, 4 * sizeof(uint64_t));
@@ -860,29 +783,28 @@ int main(int argc, char** argv) {
     cudaMemcpyToSymbol(c_Jy, h_Jy, 4 * sizeof(uint64_t));
     cudaMemcpyToSymbol(c_J_delta, h_jump_delta, 4 * sizeof(uint64_t));
 
+    // Cleanup Precompute Temp Memory
     std::free(h_batch_deltas); std::free(h_temp_Gx); std::free(h_temp_Gy);
     cudaFree(d_delta_scalars); cudaFree(d_temp_Gx); cudaFree(d_temp_Gy);
     cudaFree(d_jump_scalar); cudaFree(d_temp_Jx); cudaFree(d_temp_Jy);
 
     // ==========================================================
-    // --- INISIALISASI SCALAR (EXTREME RANDOM PERMUTATION) -----
+    // --- INISIALISASI SCALAR (RANDOM START VS LINEAR) ---------
     // ==========================================================
     if (random_mode) {
-        std::cout << "Mapping " << threadsTotal << " threads to search space using Feistel Cipher...\n";
+        std::cout << "Applying Random Start logic (XOR Shuffle)...\n";
         for (uint64_t i = 0; i < threadsTotal; ++i) {
-            // 1. Dapatkan "Dusty Coordinate" menggunakan Feistel Permutation
-            // Index 'i' diubah menjadi posisi acak yang unik di seluruh ruang threadsTotal.
-            uint64_t scrambled_idx = permute_index_feistel(i, threadsTotal, random_seed);
+            // Acak urutan chunk yang diproses oleh thread ini
+            uint64_t mask = threadsTotal - 1;
+            uint64_t scrambled_idx = i ^ (random_seed & mask);
             
-            // 2. Hitung offset scalar berdasarkan koordinat acak tersebut
             uint64_t offset_scalar[4] = {0,0,0,0};
             mul256_u64(per_thread_cnt, scrambled_idx, offset_scalar);
             
-            // 3. Tambahkan dengan range start
             uint64_t temp_scalar[4];
             add256(range_start, offset_scalar, temp_scalar);
             
-            // 4. Centering (tambah setengah batch)
+            // Tambahkan 'half' untuk center point (opsional, tapi konsisten dengan sebelumnya)
             uint64_t Sc[4];
             add256_u64(temp_scalar, (uint64_t)half, Sc);
             
@@ -891,7 +813,6 @@ int main(int argc, char** argv) {
             h_start_scalars[i*4+2] = Sc[2];
             h_start_scalars[i*4+3] = Sc[3];
         }
-        std::cout << "Permutation mapping complete. Search order is fully randomized with 0 collisions.\n";
     } else {
         // Mode Linear: Thread 0 ambil chunk 0, Thread 1 ambil chunk 1, dst.
         uint64_t cur[4] = { range_start[0], range_start[1], range_start[2], range_start[3] };
