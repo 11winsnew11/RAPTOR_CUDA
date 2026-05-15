@@ -62,12 +62,12 @@ __constant__ uint32_t c_vanity_prefix_mask;
 // ============================================================
 // Warp Reduce for Hash Counter
 // ============================================================
-__device__ __forceinline__ unsigned long long warp_reduce_add_ull(unsigned long long val)
-{
-    for (int off = 16; off > 0; off >>= 1)
-        val += __shfl_down_sync(0xFFFFFFFFu, val, off);
-    return val;
-}
+// __device__ __forceinline__ unsigned long long warp_reduce_add_ull(unsigned long long val)
+// {
+//     for (int off = 16; off > 0; off >>= 1)
+//         val += __shfl_down_sync(0xFFFFFFFFu, val, off);
+//     return val;
+// }
 
 // ============================================================
 // REPORT_MATCH macro — eliminates code duplication
@@ -894,7 +894,6 @@ static bool launch_kernel_v2(
         return false;
     }
 }
-```
 
 // ============================================================
 // External declarations
