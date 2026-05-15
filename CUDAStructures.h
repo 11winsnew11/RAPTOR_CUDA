@@ -11,7 +11,7 @@ struct FoundResult {
     uint64_t Ry[4];
 };
 
-// __device__ __constant__ uint8_t  c_target_hash160[20];
+__device__ __constant__ uint8_t  c_target_hash160[20];
 __device__ __constant__ uint32_t c_target_prefix;
 // __device__ __constant__ uint64_t c_RangeLen[4]; 
 __device__ __constant__ uint64_t c_P_RangeLen_X[4]; 
