@@ -172,7 +172,7 @@ __constant__ uint64_t c_Jy[4];
 
 __constant__ uint32_t c_vanity_len;
 __constant__ uint32_t c_vanity_prefix_mask;
-__constant__ uint32_t c_target_prefix;
+// __constant__ uint32_t c_target_prefix;
 
 // ============================================================================
 // OPTIMIZED KERNEL WITH WARP-LEVEL OPERATIONS
