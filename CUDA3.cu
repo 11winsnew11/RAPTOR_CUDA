@@ -186,7 +186,7 @@ __global__ void kernel_point_add_and_check_oneinv(
     
     int cached_found = FOUND_NONE;
     if (lane == 0) cached_found = load_found_flag_relaxed(d_found_flag);
-    cached_found = __shfl_sync(full_mask, cached_flag, 0);
+    cached_found = __shfl_sync(full_mask, cached_found, 0);
     if (cached_found == FOUND_READY) return;
 
     const uint32_t target_prefix = c_target_prefix;
