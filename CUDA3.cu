@@ -16,6 +16,7 @@
 #include <random>
 #include <fstream>
 #include <vector>
+#include <algorithm>
 
 #include "CUDAMath.h"
 #include "sha256.h"
@@ -34,26 +35,19 @@ __device__ __forceinline__ int load_found_flag_relaxed(const int* p) {
     return *((const volatile int*)p);
 }
 
-// Optimasi 1: Warp-local found flag caching
-// Mengurangi akses global memory dengan menyimpan status di register per-warp
 __device__ __forceinline__ bool warp_check_found_cached(
     const int* __restrict__ d_found_flag,
     unsigned full_mask,
     unsigned lane,
-    int& cached_flag)  // INOUT: cached flag value
+    int& cached_flag) 
 {
-    // Hanya lane 0 yang perlu baca global memory, interval-based
-    // Ini mengurangi traffic global memory secara drastis
     if (lane == 0) {
-        // Read with relaxed ordering - lebih cepat
         cached_flag = load_found_flag_relaxed(d_found_flag);
     }
     cached_flag = __shfl_sync(full_mask, cached_flag, 0);
     return cached_flag == FOUND_READY;
 }
 
-// Optimasi 2: Warp-level prefix matching dengan ballot
-// Mengembalikan ballot mask dari semua thread yang match prefix
 __device__ __forceinline__ unsigned warp_ballot_prefix(
     const uint8_t* h20,
     uint32_t target_prefix,
@@ -68,8 +62,6 @@ __device__ __forceinline__ unsigned warp_ballot_prefix(
     return __ballot_sync(full_mask, match);
 }
 
-// Optimasi 3: Warp-level full match validation
-// Hanya thread yang match prefix yang melakukan full check
 __device__ __forceinline__ bool warp_validate_full_match(
     const uint8_t* h20,
     uint32_t vanity_len,
@@ -79,7 +71,6 @@ __device__ __forceinline__ bool warp_validate_full_match(
     if (vanity_len <= 4) return true;
     
     bool full_match = true;
-    // Unrolled loop untuk performa optimal
     #pragma unroll
     for (uint32_t k = 4; k < 20; ++k) {
         if (k >= vanity_len) break;
@@ -91,8 +82,6 @@ __device__ __forceinline__ bool warp_validate_full_match(
     return full_match;
 }
 
-// Optimasi 4: Warp-cooperative result writing
-// Hanya satu thread per warp yang menulis hasil jika match
 __device__ __forceinline__ bool warp_try_write_result(
     int* __restrict__ d_found_flag,
     FoundResult* __restrict__ d_found_result,
@@ -104,14 +93,10 @@ __device__ __forceinline__ bool warp_try_write_result(
     unsigned lane,
     bool local_match)
 {
-    // Use ballot to find if any thread in warp matched
     unsigned match_ballot = __ballot_sync(full_mask, local_match);
     if (match_ballot == 0) return false;
     
-    // Find lowest matching lane
     unsigned match_lane = __ffs(match_ballot) - 1;
-    
-    // Only lowest matching lane attempts CAS
     bool should_write = (lane == match_lane);
     bool success = false;
     
@@ -131,27 +116,22 @@ __device__ __forceinline__ bool warp_try_write_result(
         }
     }
     
-    // Broadcast success to all lanes
     success = __shfl_sync(full_mask, (int)success, match_lane);
     return success;
 }
 
-// Optimasi 5: Warp-level hash accumulation
-// Mengurangi atomicAdd frequency dengan batch accumulation
 __device__ __forceinline__ void warp_accum_hash_optimized(
     unsigned int& local_count,
     unsigned long long* __restrict__ hashes_accum,
     unsigned full_mask,
     unsigned lane)
 {
-    // Sum all local counts in warp using shuffle
     unsigned int sum = local_count;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1) {
         sum += __shfl_down_sync(full_mask, sum, offset);
     }
     
-    // Only lane 0 does atomic add
     if (lane == 0 && sum > 0) {
         atomicAdd(hashes_accum, (unsigned long long)sum);
     }
@@ -172,7 +152,6 @@ __constant__ uint64_t c_Jy[4];
 
 __constant__ uint32_t c_vanity_len;
 __constant__ uint32_t c_vanity_prefix_mask;
-// __constant__ uint32_t c_target_prefix;
 
 // ============================================================================
 // OPTIMIZED KERNEL WITH WARP-LEVEL OPERATIONS
@@ -205,19 +184,17 @@ __global__ void kernel_point_add_and_check_oneinv(
     const unsigned warp_id = threadIdx.x >> 5;
     const unsigned full_mask = 0xFFFFFFFFu;
     
-    // Optimasi: Cached found flag - baca global memory lebih jarang
     int cached_found = FOUND_NONE;
     if (lane == 0) cached_found = load_found_flag_relaxed(d_found_flag);
-    cached_found = __shfl_sync(full_mask, cached_found, 0);
+    cached_found = __shfl_sync(full_mask, cached_flag, 0);
     if (cached_found == FOUND_READY) return;
 
     const uint32_t target_prefix = c_target_prefix;
     const uint32_t vanity_len = c_vanity_len;
     const uint32_t vanity_mask = c_vanity_prefix_mask;
 
-    // Optimasi: Local hash counter dengan threshold yang lebih besar
     unsigned int local_hashes = 0;
-    #define OPT_FLUSH_THRESHOLD 131072u  // 2x lebih besar untuk kurangi atomic
+    #define OPT_FLUSH_THRESHOLD 131072u
     #define OPT_WARP_FLUSH() warp_accum_hash_optimized(local_hashes, hashes_accum, full_mask, lane)
     #define OPT_MAYBE_FLUSH() do { if ((local_hashes & (OPT_FLUSH_THRESHOLD - 1u)) == 0u) OPT_WARP_FLUSH(); } while (0)
 
@@ -241,11 +218,10 @@ __global__ void kernel_point_add_and_check_oneinv(
     }
 
     uint32_t batches_done = 0;
-    uint32_t found_check_interval = 0;  // Optimasi: Cek found setiap N iterations
+    uint32_t found_check_interval = 0;
 
     while (batches_done < max_batches_per_launch && ge256_u64(rem, (uint64_t)B)) {
         
-        // Optimasi: Check found flag dengan interval (bukan setiap iterasi)
         if (++found_check_interval >= 8) {
             found_check_interval = 0;
             if (warp_check_found_cached(d_found_flag, full_mask, lane, cached_found)) {
@@ -253,21 +229,18 @@ __global__ void kernel_point_add_and_check_oneinv(
             }
         }
 
-        // ---- CHECK CURRENT POINT ----
         {
             uint8_t h20[20];
             uint8_t prefix = (uint8_t)(y1[0] & 1ULL) ? 0x03 : 0x02;
             getHash160_33_from_limbs(prefix, x1, h20);
             ++local_hashes; OPT_MAYBE_FLUSH();
 
-            // Optimasi: Gunakan warp ballot untuk prefix check
             unsigned prefix_ballot = warp_ballot_prefix(h20, target_prefix, vanity_mask, full_mask);
             
             if (prefix_ballot != 0) {
                 bool local_match = (prefix_ballot >> lane) & 1u;
                 bool full_match = warp_validate_full_match(h20, vanity_len, local_match);
                 
-                // Optimasi: Cooperative result writing
                 if (warp_try_write_result(d_found_flag, d_found_result, S, x1, y1, 
                                           (int)gid, full_mask, lane, full_match)) {
                     OPT_WARP_FLUSH(); return;
@@ -276,7 +249,6 @@ __global__ void kernel_point_add_and_check_oneinv(
             }
         }
 
-        // ---- PRECOMPUTE SUB-PRODUCTS ----
         uint64_t subp[MAX_BATCH_SIZE/2][4];
         uint64_t acc[4], tmp[4];
 
@@ -295,7 +267,6 @@ __global__ void kernel_point_add_and_check_oneinv(
             for (int j=0; j<4; ++j) subp[i][j] = acc[j];
         }
 
-        // ---- COMPUTE SINGLE INVERSE ----
         uint64_t d0[4], inverse[5];
         #pragma unroll
         for (int j=0; j<4; ++j) d0[j] = c_Gx[0*4 + j];
@@ -306,10 +277,8 @@ __global__ void kernel_point_add_and_check_oneinv(
         inverse[4] = 0ull;
         _ModInv(inverse);
 
-        // ---- CHECK +Gi AND -Gi POINTS ----
         for (int i = 0; i < half; ++i) {
             
-            // Optimasi: Check found flag di awal setiap 8 iterasi loop
             if ((i & 7) == 0) {
                 if (warp_check_found_cached(d_found_flag, full_mask, lane, cached_found)) {
                     OPT_WARP_FLUSH(); return;
@@ -319,7 +288,6 @@ __global__ void kernel_point_add_and_check_oneinv(
             uint64_t dx_inv_i[4];
             _ModMult(dx_inv_i, subp[i], inverse);
 
-            // Load Gi coordinates once
             uint64_t px_i[4], py_i[4];
             #pragma unroll
             for (int j=0; j<4; ++j) { 
@@ -327,117 +295,68 @@ __global__ void kernel_point_add_and_check_oneinv(
                 py_i[j] = c_Gy[(size_t)i*4+j]; 
             }
 
-            // ---- CHECK +Gi ----
             {
                 uint64_t px3[4], s[4], lam[4];
-
                 ModSub256(s, py_i, y1);
                 _ModMult(lam, s, dx_inv_i);
-
                 _ModSqr(px3, lam);     
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
-
                 ModSub256(s, x1, px3); 
                 _ModMult(s, s, lam);
-                uint8_t odd; 
-                ModSub256isOdd(s, y1, &odd);
-
-                uint8_t h20[20]; 
-                getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                uint8_t odd; ModSub256isOdd(s, y1, &odd);
+                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; OPT_MAYBE_FLUSH();
 
-                // Optimasi: Warp ballot prefix check
                 unsigned prefix_ballot = warp_ballot_prefix(h20, target_prefix, vanity_mask, full_mask);
-                
                 if (prefix_ballot != 0) {
                     bool local_match = (prefix_ballot >> lane) & 1u;
                     bool full_match = warp_validate_full_match(h20, vanity_len, local_match);
-                    
                     if (full_match) {
-                        // Calculate scalar for +Gi
                         uint64_t fs[4]; 
                         #pragma unroll
                         for (int k=0; k<4; ++k) fs[k] = S[k];
                         uint64_t addv = (uint64_t)(i + 1);
-                        for (int k=0; k<4 && addv; ++k) { 
-                            uint64_t old = fs[k]; 
-                            fs[k] = old + addv; 
-                            addv = (fs[k] < old) ? 1ull : 0ull; 
-                        }
-                        
-                        // Calculate Y for result
-                        uint64_t y3[4], t[4]; 
-                        ModSub256(t, x1, px3); 
-                        _ModMult(y3, t, lam); 
-                        ModSub256(y3, y3, y1);
-                        
-                        if (warp_try_write_result(d_found_flag, d_found_result, fs, px3, y3,
-                                                  (int)gid, full_mask, lane, local_match)) {
-                            OPT_WARP_FLUSH(); return;
-                        }
+                        for (int k=0; k<4 && addv; ++k) { uint64_t old=fs[k]; fs[k]=old+addv; addv=(fs[k]<old)?1ull:0ull; }
+                        uint64_t y3[4], t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+                        if (warp_try_write_result(d_found_flag, d_found_result, fs, px3, y3, (int)gid, full_mask, lane, local_match)) { OPT_WARP_FLUSH(); return; }
                     }
                     __syncwarp(full_mask);
                 }
             }
 
-            // ---- CHECK -Gi ----
             {
                 uint64_t px3[4], s[4], lam[4];
                 uint64_t neg_py_i[4];
                 ModNeg256(neg_py_i, py_i); 
-
                 ModSub256(s, neg_py_i, y1);
                 _ModMult(lam, s, dx_inv_i);
-
                 _ModSqr(px3, lam);
                 ModSub256(px3, px3, x1);
                 ModSub256(px3, px3, px_i);
-
                 ModSub256(s, x1, px3);
                 _ModMult(s, s, lam);
-                uint8_t odd; 
-                ModSub256isOdd(s, y1, &odd);
-
-                uint8_t h20[20]; 
-                getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
+                uint8_t odd; ModSub256isOdd(s, y1, &odd);
+                uint8_t h20[20]; getHash160_33_from_limbs(odd?0x03:0x02, px3, h20);
                 ++local_hashes; OPT_MAYBE_FLUSH();
 
-                // Optimasi: Warp ballot prefix check
                 unsigned prefix_ballot = warp_ballot_prefix(h20, target_prefix, vanity_mask, full_mask);
-                
                 if (prefix_ballot != 0) {
                     bool local_match = (prefix_ballot >> lane) & 1u;
                     bool full_match = warp_validate_full_match(h20, vanity_len, local_match);
-                    
                     if (full_match) {
-                        // Calculate scalar for -Gi
                         uint64_t fs[4]; 
                         #pragma unroll
                         for (int k=0; k<4; ++k) fs[k] = S[k];
                         uint64_t sub = (uint64_t)(i + 1);
-                        for (int k=0; k<4 && sub; ++k) { 
-                            uint64_t old = fs[k]; 
-                            fs[k] = old - sub; 
-                            sub = (old < sub) ? 1ull : 0ull; 
-                        }
-                        
-                        // Calculate Y for result
-                        uint64_t y3[4], t[4]; 
-                        ModSub256(t, x1, px3); 
-                        _ModMult(y3, t, lam); 
-                        ModSub256(y3, y3, y1);
-                        
-                        if (warp_try_write_result(d_found_flag, d_found_result, fs, px3, y3,
-                                                  (int)gid, full_mask, lane, local_match)) {
-                            OPT_WARP_FLUSH(); return;
-                        }
+                        for (int k=0; k<4 && sub; ++k) { uint64_t old=fs[k]; fs[k]=old-sub; sub=(old<sub)?1ull:0ull; }
+                        uint64_t y3[4], t[4]; ModSub256(t, x1, px3); _ModMult(y3, t, lam); ModSub256(y3, y3, y1);
+                        if (warp_try_write_result(d_found_flag, d_found_result, fs, px3, y3, (int)gid, full_mask, lane, local_match)) { OPT_WARP_FLUSH(); return; }
                     }
                     __syncwarp(full_mask);
                 }
             }
 
-            // Update inverse for next iteration (skip for last)
             if (i < half - 1) {
                 uint64_t gxmi[4];
                 #pragma unroll
@@ -447,15 +366,12 @@ __global__ void kernel_point_add_and_check_oneinv(
             }
         }
 
-        // ---- UPDATE TO NEXT BATCH (P + J) ----
         {
             uint64_t lam[4], s[4], x3[4], y3[4];
-
             uint64_t Jy_minus_y1[4];
             #pragma unroll
             for (int j=0; j<4; ++j) Jy_minus_y1[j] = c_Jy[j];
             ModSub256(Jy_minus_y1, Jy_minus_y1, y1);
-
             _ModMult(lam, Jy_minus_y1, inverse);
             _ModSqr(x3, lam);
             ModSub256(x3, x3, x1);
@@ -463,29 +379,21 @@ __global__ void kernel_point_add_and_check_oneinv(
             #pragma unroll
             for (int j=0; j<4; ++j) Jx_local[j] = c_Jx[j];
             ModSub256(x3, x3, Jx_local);
-
             ModSub256(s, x1, x3);
             _ModMult(y3, s, lam);
             ModSub256(y3, y3, y1);
-
             #pragma unroll
             for (int j=0; j<4; ++j) { x1[j] = x3[j]; y1[j] = y3[j]; }
         }
 
-        // Update scalar and remaining count
         {
-            uint64_t addv = (uint64_t)B;
-            for (int k=0; k<4 && addv; ++k) { 
-                uint64_t old = S[k]; 
-                S[k] = old + addv; 
-                addv = (S[k] < old) ? 1ull : 0ull; 
-            }
+            uint64_t addv=(uint64_t)B;
+            for (int k=0; k<4 && addv; ++k) { uint64_t old=S[k]; S[k]=old+addv; addv=(S[k]<old)?1ull:0ull; }
             sub256_u64_inplace(rem, (uint64_t)B);
         }
         ++batches_done;
     }
 
-    // ---- WRITE RESULTS ----
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
         Rx[gid*4+i] = x1[i];
@@ -494,7 +402,6 @@ __global__ void kernel_point_add_and_check_oneinv(
         start_scalars[gid*4+i] = S[i];
     }
     
-    // Optimasi: Warp-cooperative any_left flag
     bool has_remaining = (rem[0] | rem[1] | rem[2] | rem[3]) != 0ull;
     unsigned remain_ballot = __ballot_sync(full_mask, has_remaining);
     if (lane == 0 && remain_ballot != 0) {
@@ -537,7 +444,7 @@ struct ScanState {
 #pragma pack(pop)
 
 static const uint32_t STATE_MAGIC   = 0x5343414E;
-static const uint32_t STATE_VERSION = 2;
+static const uint32_t STATE_VERSION = 3; // Incremented for Sparse Density RNG
 
 static uint32_t calcStateChecksum(const ScanState& s) {
     uint32_t c = s.magic;
@@ -586,58 +493,128 @@ static bool loadState(const std::string& filename, uint64_t& r_idx, uint32_t& s,
 }
 
 // ============================================================================
-// GALOIS FIELD (POLYNOMIAL EXTREME) RANDOM PERMUTATION
+// COMBINED IDE 3 & 5: SPARSE AFFINE + DENSITY GUIDED PERMUTATION
 // ============================================================================
 
-class PolynomialExtremeRNG {
+class SparseDensityRNG {
 private:
-    uint64_t A0;
-    uint64_t B0;
+    int random_bits;
+    int density_bits;
+    int local_bits;
+    uint64_t local_mask;
+    uint64_t total_mask;
 
-    static uint64_t gf64_clmul(uint64_t a, uint64_t b) {
-        uint64_t result = 0;
-        while (b) {
-            if (b & 1) result ^= a;
-            bool hi_bit = (a >> 63) & 1;
-            a <<= 1;
-            if (hi_bit) a ^= 0x1B;
-            b >>= 1;
+    // Ide 3: Sparse Affine Terms
+    static const int MAX_TERMS = 6;
+    struct SparseTerm { int shift; };
+    SparseTerm terms[MAX_TERMS];
+    int num_terms;
+    uint64_t B_local;
+
+    // Ide 5: Density Map
+    uint64_t* region_order; 
+
+    // Fast heuristic density probe (FNV-1a inspired)
+    static uint64_t fast_density_probe(uint64_t region_idx, uint64_t seed) {
+        uint64_t hash = seed ^ 0xCBF29CE484222325ULL;
+        hash ^= (region_idx & 0xFF);
+        hash *= 0x100000001B3ULL;
+        hash ^= (region_idx >> 8) & 0xFF;
+        hash *= 0x100000001B3ULL;
+        return hash;
+    }
+
+    void init_sparse(uint64_t seed) {
+        // Generate exactly 6 pseudo-random bit shifts for sparse multiplication
+        uint64_t tmp = seed;
+        num_terms = 0;
+        while(num_terms < MAX_TERMS) {
+            int bit_pos = tmp & 63;
+            bool dup = false;
+            for(int i=0; i<num_terms; ++i) if(terms[i].shift == bit_pos) { dup = true; break; }
+            if (!dup) terms[num_terms++].shift = bit_pos;
+            
+            tmp = (tmp >> 8) ^ (tmp << 56); // Mix bits
+            if (num_terms == 1 && terms[0].shift == 0) terms[0].shift = 1; // Prevent identity
         }
-        return result;
+        B_local = (~seed) ^ 0x5A5A5A5A5A5A5A5AULL;
+    }
+
+    void init_density_map(uint64_t seed) {
+        uint64_t num_regions = 1ULL << density_bits;
+        region_order = new uint64_t[num_regions];
+        for (uint64_t i = 0; i < num_regions; ++i) region_order[i] = i;
+
+        // Sort regions by descending "density heuristic"
+        std::sort(region_order, region_order + num_regions, 
+            [seed](uint64_t a, uint64_t b) {
+                return fast_density_probe(a, seed) > fast_density_probe(b, seed);
+            }
+        );
+    }
+
+    // Ultra-fast GF(2^64) shift with reduction
+    static uint64_t gf64_shift_sparse(uint64_t x, int shift) {
+        if (shift == 0) return x;
+        uint64_t lo = x << shift;
+        uint64_t hi = x >> (64 - shift);
+        uint64_t red = 0;
+        for (int i = 0; i < shift; ++i) {
+            if ((hi >> i) & 1) red ^= (0x1BULL << i); // Reduce by x^64+x^4+x^3+x+1
+        }
+        return lo ^ red;
+    }
+
+    uint64_t sparse_affine(uint64_t x) const {
+        if (random_bits == 0) return 0;
+        uint64_t result = 0;
+        for (int i = 0; i < num_terms; ++i) {
+            result ^= gf64_shift_sparse(x, terms[i].shift);
+        }
+        result ^= B_local;
+        return (random_bits < 64) ? (result & total_mask) : result;
     }
 
 public:
-    PolynomialExtremeRNG(uint64_t seed) {
-        A0 = seed ^ 0xA5A5A5A5A5A5A5A5ULL;
-        if (A0 == 0) A0 = 0xAAAAAAAAAAAAAAAAULL;
-        B0 = (~seed) ^ 0x5A5A5A5A5A5A5A5AULL;
+    SparseDensityRNG(uint64_t seed, int rand_bits) : random_bits(rand_bits) {
+        total_mask = (random_bits >= 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << random_bits) - 1);
+        
+        // Dynamic density bits allocation
+        density_bits = 0;
+        if (rand_bits >= 16) density_bits = 8;
+        else if (rand_bits >= 8) density_bits = 4;
+        
+        local_bits = rand_bits - density_bits;
+        local_mask = (local_bits >= 64) ? 0xFFFFFFFFFFFFFFFFULL : ((1ULL << local_bits) - 1);
+
+        init_sparse(seed);
+        region_order = nullptr;
+        if (density_bits > 0) {
+            init_density_map(seed ^ 0xDEADBEEFCAFEBABEULL);
+        }
     }
 
-    uint64_t permute(uint64_t r_idx, int random_bits) {
+    ~SparseDensityRNG() {
+        delete[] region_order;
+    }
+
+    uint64_t permute(uint64_t r_idx) const {
         if (random_bits == 0) return 0;
         
-        if (random_bits == 64) {
-            return gf64_clmul(A0, r_idx) ^ B0;
+        if (density_bits == 0) {
+            return sparse_affine(r_idx);
         }
 
-        int half_bits = random_bits / 2;
-        uint64_t mask = (1ULL << half_bits) - 1;
-        uint64_t L = (r_idx >> half_bits) & mask;
-        uint64_t R = r_idx & mask;
+        // Split index into macro-region and micro-local
+        uint64_t linear_region = r_idx >> local_bits;
+        uint64_t local_idx = r_idx & local_mask;
 
-        uint64_t A = A0;
-        uint64_t B = B0;
-
-        for (int i = 0; i < 4; ++i) {
-            uint64_t F_R = (gf64_clmul(A, R) ^ B) & mask;
-            uint64_t tmp = L ^ F_R;
-            L = R;
-            R = tmp;
-            A = gf64_clmul(A, 0x123456789ABCDEF0ULL);
-            B = (B << 1) | (B >> 63);
-        }
-
-        return (L << half_bits) | R;
+        // Remap to highest "density" region first
+        uint64_t actual_region = region_order[linear_region % (1ULL << density_bits)];
+        
+        // Combine and apply lightning-fast sparse affine transform
+        uint64_t combined = (actual_region << local_bits) | local_idx;
+        return sparse_affine(combined);
     }
 };
 
@@ -672,7 +649,6 @@ static std::string buildSliceHex(int common_hex, uint32_t prefix_nibble,
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_sigint);
 
-    // --- Configuration ---
     std::string vanity_hex;
     std::string range_hex;
     uint32_t runtime_points_batch_size = 128;
@@ -772,7 +748,6 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // --- Parsing Vanity Hash160 ---
     if (vanity_hex.length() > 40) {
         std::cerr << "Error: Vanity prefix cannot exceed 20 bytes (40 hex chars).\n";
         return EXIT_FAILURE;
@@ -802,7 +777,6 @@ int main(int argc, char** argv) {
 
     std::cout << "Searching for Vanity Prefix: " << vanity_hex << " (" << vanity_len << " bytes)\n";
 
-    // --- Parse Range & Calculate Bit Split ---
     size_t colon_pos = range_hex.find(':');
     if (colon_pos == std::string::npos) { 
         std::cerr << "Error: range format must be start:end\n"; 
@@ -906,11 +880,10 @@ int main(int argc, char** argv) {
     std::cout << std::left << std::setw(25) << "Linear bits"      << " : " << linear_bits << " (2^" << linear_bits << " = " << keys_per_slice << " keys/slice)\n";
     std::cout << std::left << std::setw(25) << "Total slices"     << " : " << total_slices << "\n";
     std::cout << std::left << std::setw(25) << "Total keys"       << " : " << total_keys << " (2^" << (random_bits+sub_random_bits+linear_bits) << ")\n";
-    std::cout << std::left << std::setw(25) << "Shuffle Algo"     << " : " << (no_shuffle ? "Disabled" : "Galois-Field Polynomial Extreme") << "\n";
+    std::cout << std::left << std::setw(25) << "Shuffle Algo"     << " : " << (no_shuffle ? "Disabled" : "Sparse Affine + Density Guided") << "\n";
     std::cout << std::left << std::setw(25) << "Warp Optimized"   << " : Yes (Ballot + Cached Flag + Coop Write)\n";
     std::cout << std::left << std::setw(25) << "State file"       << " : " << state_file << "\n\n";
 
-    // --- Validate batch size ---
     auto is_pow2 = [](uint32_t v)->bool { return v && ((v & (v-1)) == 0); };
     if (!is_pow2(runtime_points_batch_size) || (runtime_points_batch_size & 1u)) {
         std::cerr << "Error: batch size must be even and a power of two.\n";
@@ -927,7 +900,6 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
-    // --- GPU Setup ---
     int device=0; 
     cudaDeviceProp prop{};
     if (cudaGetDevice(&device)!=cudaSuccess || cudaGetDeviceProperties(&prop, device)!=cudaSuccess) {
@@ -995,7 +967,6 @@ int main(int argc, char** argv) {
         return EXIT_FAILURE; 
     }
 
-    // --- Allocate Host Buffers ---
     uint64_t* h_counts256     = nullptr;
     uint64_t* h_start_scalars = nullptr;
     cudaHostAlloc(&h_counts256,     threadsTotal * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -1011,7 +982,6 @@ int main(int argc, char** argv) {
     const uint32_t B = runtime_points_batch_size;
     const uint32_t half = B >> 1;
 
-    // --- Allocate Device Buffers ---
     uint64_t *d_start_scalars=nullptr, *d_Px=nullptr, *d_Py=nullptr, *d_Rx=nullptr, *d_Ry=nullptr, *d_counts256=nullptr;
     int *d_found_flag=nullptr; 
     FoundResult *d_found_result=nullptr;
@@ -1057,7 +1027,6 @@ int main(int argc, char** argv) {
         cudaMemcpyToSymbol(c_vanity_prefix_mask, &vanity_prefix_mask, sizeof(vanity_prefix_mask));
     }
 
-    // --- Precompute G points ---
     {
         uint64_t* h_scalars_half = nullptr;
         cudaHostAlloc(&h_scalars_half, (size_t)half * 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -1087,7 +1056,6 @@ int main(int argc, char** argv) {
         std::free(h_Gx_half); std::free(h_Gy_half);
     }
 
-    // --- Precompute J point ---
     {
         uint64_t* h_scalarB = nullptr;
         cudaHostAlloc(&h_scalarB, 4 * sizeof(uint64_t), cudaHostAllocWriteCombined | cudaHostAllocMapped);
@@ -1114,7 +1082,6 @@ int main(int argc, char** argv) {
         cudaFreeHost(h_scalarB);
     }
 
-    // --- Memory Info ---
     size_t freeB=0,totalB=0; 
     cudaMemGetInfo(&freeB,&totalB);
     size_t usedB = totalB - freeB;
@@ -1132,7 +1099,6 @@ int main(int argc, char** argv) {
               << std::fixed << std::setprecision(1) << util << "% ("
               << human_bytes((double)usedB) << " / " << human_bytes((double)totalB) << ")\n\n";
 
-    // --- Load State ---
     uint64_t start_r_idx = 0;
     uint32_t start_s_val = 0;
     uint64_t start_total_hashes = 0;
@@ -1146,7 +1112,7 @@ int main(int argc, char** argv) {
             std::cout << "  Random index : " << start_r_idx << " / " << num_random_slices << "\n";
             std::cout << "  Sub-random   : " << start_s_val << " / " << num_sub_slices << "\n";
             std::cout << "  Prev hashes  : " << start_total_hashes << "\n";
-            std::cout << "  GF Poly Seed : 0x" << std::hex << rng_seed << std::dec << "\n\n";
+            std::cout << "  Sparse Seed  : 0x" << std::hex << rng_seed << std::dec << "\n\n";
         } else {
             std::cout << "Warning: State file invalid (out of range), starting fresh.\n";
             start_r_idx = 0;
@@ -1159,11 +1125,12 @@ int main(int argc, char** argv) {
     if (!has_seed) {
         std::random_device rd;
         rng_seed = ((uint64_t)rd() << 32) | rd();
-        std::cout << "Generated Galois-Field Poly Seed: 0x" << std::hex << rng_seed << std::dec << "\n";
+        std::cout << "Generated Sparse Density Seed: 0x" << std::hex << rng_seed << std::dec << "\n";
         std::cout << "(Use --seed 0x" << std::hex << rng_seed << std::dec << " to reproduce this run)\n\n";
     }
 
-    PolynomialExtremeRNG poly_rng(rng_seed);
+    // Initialize Ultimate RNG Engine
+    SparseDensityRNG sparse_rng(rng_seed, random_bits);
 
     cudaStream_t streamKernel;
     ck(cudaStreamCreateWithFlags(&streamKernel, cudaStreamNonBlocking), "create stream");
@@ -1174,8 +1141,7 @@ int main(int argc, char** argv) {
         ck(cudaMemcpy(d_hashes_accum, &zero64, sizeof(unsigned long long), cudaMemcpyHostToDevice), "reset hashes_accum");
     }
 
-    // --- Main Scan Loop ---
-    std::cout << "======== Phase-1: Warp-Optimized Vanity Search =============\n";
+    std::cout << "======== Phase-1: Sparse-Density Vanity Search =============\n";
 
     auto t0 = std::chrono::high_resolution_clock::now();
     auto tLast = t0;
@@ -1189,7 +1155,7 @@ int main(int argc, char** argv) {
     for (uint64_t r_idx = start_r_idx; r_idx < num_random_slices && !g_sigint; ++r_idx) {
         uint64_t R = r_idx;
         if (!no_shuffle && random_bits > 0) {
-            R = poly_rng.permute(r_idx, random_bits);
+            R = sparse_rng.permute(r_idx); // Lightning fast permutation
         }
 
         uint32_t s_start = (r_idx == start_r_idx) ? start_s_val : 0;
